@@ -1,0 +1,39 @@
+
+{
+  "manifest_version": 3,
+  "name": "Gemini Browser AI Agent",
+  "version": "1.0",
+  "description": "A self-contained browser AI agent powered by Gemini Live API.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Open AI Agent"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["audio-processor.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
