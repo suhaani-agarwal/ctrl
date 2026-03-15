@@ -5,6 +5,8 @@ let apiKey = null;
 let reconnectCount = 0;
 const MAX_RECONNECTS = 3;
 let intentionalClose = false;
+let micTabId = null;
+let micOffscreenActive = false;
 
 // Open side panel on icon click
 chrome.action.onClicked.addListener((tab) => {
@@ -134,8 +136,102 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // Mic control messages from sidepanel
+  if (message.type === "START_MIC") {
+    if (micOffscreenActive || micTabId !== null) {
+      sendResponse({ success: true, info: "Mic already started" });
+      return;
+    }
+
+    // Prefer the Offscreen Document API which allows hidden pages to capture audio
+    if (chrome.offscreen && chrome.offscreen.hasDocument) {
+      chrome.offscreen.hasDocument().then((has) => {
+        if (!has) {
+          chrome.offscreen.createDocument({
+            url: chrome.runtime.getURL('audio-capture.html'),
+            reasons: ['AUDIO_CAPTURE'],
+            justification: 'Capture microphone for Gemini Live session'
+          }).then(() => {
+            micOffscreenActive = true;
+            // Start capture inside the offscreen document
+            chrome.runtime.sendMessage({ type: "START_CAPTURE" });
+            sendResponse({ success: true });
+          }).catch((err) => {
+            // Fallback to creating a hidden tab
+            console.error('Offscreen create failed, falling back to tab:', err);
+            chrome.tabs.create({ url: chrome.runtime.getURL('audio-capture.html'), active: false }, (tab) => {
+              if (chrome.runtime.lastError || !tab) {
+                sendResponse({ success: false, error: chrome.runtime.lastError?.message || 'Could not create capture tab' });
+                return;
+              }
+              micTabId = tab.id;
+              setTimeout(() => chrome.runtime.sendMessage({ type: "START_CAPTURE" }), 200);
+              sendResponse({ success: true });
+            });
+          });
+        } else {
+          // Offscreen already exists
+          micOffscreenActive = true;
+          chrome.runtime.sendMessage({ type: "START_CAPTURE" });
+          sendResponse({ success: true });
+        }
+      });
+      return true; // indicate async
+    }
+
+    // If offscreen API not available, fallback to hidden tab
+    chrome.tabs.create({ url: chrome.runtime.getURL('audio-capture.html'), active: false }, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        sendResponse({ success: false, error: chrome.runtime.lastError?.message || 'Could not create capture tab' });
+        return;
+      }
+      micTabId = tab.id;
+      setTimeout(() => chrome.runtime.sendMessage({ type: "START_CAPTURE" }), 200);
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (message.type === "STOP_MIC") {
+    if (!micOffscreenActive && micTabId === null) {
+      sendResponse({ success: true, info: "Mic not running" });
+      return;
+    }
+    // Tell the capture page to stop, then remove/close the offscreen or tab
+    chrome.runtime.sendMessage({ type: "STOP_CAPTURE" }, () => {
+      if (micOffscreenActive && chrome.offscreen && chrome.offscreen.closeDocument) {
+        chrome.offscreen.closeDocument().then(() => { micOffscreenActive = false; micTabId = null; }).catch(() => { micOffscreenActive = false; });
+      }
+      if (micTabId !== null) {
+        chrome.tabs.remove(micTabId, () => { micTabId = null; });
+      }
+    });
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "GET_PAGE_CONTEXT") {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]) {
+        chrome.tabs.sendMessage(tabs[0].id, { type: "GET_PAGE_CONTEXT", selector: message.selector }, (response) => {
+          sendResponse(response);
+        });
+      } else {
+        sendResponse({ error: 'No active tab' });
+      }
+    });
+    return true;
+  }
+
   if (message.type === "SEND_TO_GEMINI") {
     console.log("Background: Forwarding message to Gemini");
+    // If this is realtime audio data, emit a short-lived event so UI can show activity
+    try {
+      if (message.data && message.data.realtimeInput && message.data.realtimeInput.mediaChunks) {
+        chrome.runtime.sendMessage({ type: "MIC_CHUNK_SENT" });
+      }
+    } catch (e) { /* ignore */ }
+
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message.data));
       sendResponse({ success: true });

@@ -118,4 +118,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: false, error: e.message });
     }
   }
+  if (message.type === "GET_PAGE_CONTEXT") {
+    try {
+      const selector = message.selector;
+      const title = document.title || '';
+      const url = location.href || '';
+      const selection = window.getSelection ? window.getSelection().toString().slice(0, 300) : '';
+      let elementInfo = null;
+      if (selector && selector !== "null") {
+        const el = document.querySelector(selector);
+        if (el) {
+          elementInfo = {
+            tag: el.tagName,
+            id: el.id || null,
+            class: el.className || null,
+            text: (el.innerText || el.textContent || '').trim().slice(0, 500),
+            value: el.value || null,
+            href: el.href || null
+          };
+        }
+      }
+      sendResponse({ title, url, selection, element: elementInfo });
+    } catch (e) {
+      sendResponse({ error: e.message });
+    }
+    return true;
+  }
 });
