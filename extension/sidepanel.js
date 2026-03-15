@@ -91,6 +91,63 @@ micBtn.onclick = async () => {
     return;
   }
 
+  // Before starting a new spoken turn, send a lightweight DOM preview of the current page
+  try {
+    statusText.innerText = "Capturing screen context...";
+    const domPreview = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "GET_DOM_PREVIEW", maxNodes: 60 }, (resp) => resolve(resp || {}));
+    });
+
+    const previewTextParts = [];
+    if (domPreview.title) previewTextParts.push(`Title: ${domPreview.title}`);
+    if (domPreview.url) previewTextParts.push(`URL: ${domPreview.url}`);
+    if (domPreview.viewport) {
+      previewTextParts.push(
+        `Viewport: ${domPreview.viewport.width}x${domPreview.viewport.height}`
+      );
+    }
+    if (Array.isArray(domPreview.nodes)) {
+      const nodeLines = domPreview.nodes.slice(0, 40).map((n, idx) => {
+        const bits = [];
+        if (n.role) bits.push(`role=${n.role}`);
+        bits.push(`tag=${n.tag}`);
+        if (n.text) bits.push(`text="${n.text}"`);
+        if (n.href) bits.push(`href=${n.href}`);
+        if (n.selector) bits.push(`selector=${n.selector}`);
+        return `N${idx + 1}: ${bits.join(" | ")}`;
+      });
+      if (nodeLines.length) {
+        previewTextParts.push("DOM_PREVIEW:\n" + nodeLines.join("\n"));
+      }
+    }
+
+    const previewText = previewTextParts.join(" | ").slice(0, 4000);
+    if (previewText) {
+      chrome.runtime.sendMessage({
+        type: "SEND_TO_GEMINI",
+        data: {
+          clientContent: {
+            turns: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text:
+                      "Here is a compact DOM-based preview of the current page. Use these selectors when proposing actions.\n" +
+                      previewText,
+                  },
+                ],
+              },
+            ],
+            turnComplete: true,
+          },
+        },
+      });
+    }
+  } catch (e) {
+    console.error("Failed to build/send DOM preview", e);
+  }
+
   statusText.innerText = "Checking mic permission...";
   chrome.runtime.sendMessage({ type: "REQUEST_MIC_PERMISSION" }, (resp) => {
     if (resp && resp.granted) {

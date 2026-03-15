@@ -42,7 +42,28 @@ function connectWebSocket(key) {
         model: "models/gemini-2.5-flash-native-audio-latest",
         generation_config: {
           response_modalities: "audio"
-        }
+        },
+        system_instruction: {
+          role: "system",
+          parts: [
+            {
+              text:
+                "You are a real-time browser copilot that can reason about and act on the user's current web page.\n" +
+                "- You WILL receive compact DOM-based screen previews as plain text turns, usually starting with DOM_PREVIEW or PAGE_CONTEXT. " +
+                "Treat these as your \"eyes\" on the page and rely on them instead of asking for a screenshot.\n" +
+                "- Do NOT say things like 'I do not have access to the screen', 'I cannot see the page', or similar. " +
+                "You DO have structured context via these DOM previews.\n" +
+                "- When you want the extension to take an action (click, type, scroll, navigate), emit lines in the format:\n" +
+                "  ACTION:click:CSS_SELECTOR\n" +
+                "  ACTION:fill:CSS_SELECTOR:TEXT_TO_TYPE\n" +
+                "  ACTION:scroll::PIXELS\n" +
+                "  ACTION:navigate::URL\n" +
+                "- Prefer selectors that appear in the provided DOM preview (e.g. tag, id, classes). " +
+                "Avoid vague natural language like 'the blue button'; instead, pick a specific selector from the preview.\n" +
+                "- Always explain in natural language what you are doing for the user, in addition to emitting ACTION lines.",
+            },
+          ],
+        },
       }
     };
     console.log("Background: Sending setup message");
@@ -218,6 +239,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
       } else {
         sendResponse({ error: 'No active tab' });
+      }
+    });
+    return true;
+  }
+
+  if (message.type === "GET_DOM_PREVIEW") {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs[0]) {
+        chrome.tabs.sendMessage(
+          tabs[0].id,
+          { type: "GET_DOM_PREVIEW", maxNodes: message.maxNodes },
+          (response) => {
+            sendResponse(response);
+          }
+        );
+      } else {
+        sendResponse({ error: "No active tab" });
       }
     });
     return true;

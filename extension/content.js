@@ -1,5 +1,82 @@
 // content.js
 
+function isElementVisible(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = window.getComputedStyle(el);
+  if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return false;
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  if (rect.bottom < 0 || rect.top > window.innerHeight) return false;
+  return true;
+}
+
+function buildDomPreview(maxNodes = 80) {
+  const nodes = [];
+  const queue = [];
+  if (document.body) queue.push({ el: document.body, depth: 0 });
+
+  const pushNode = (el, depth) => {
+    if (!isElementVisible(el)) return;
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute("role") || (tag === "a" ? "link" : tag === "button" ? "button" : null);
+    const text = (el.innerText || el.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
+    const id = el.id || null;
+    const cls = typeof el.className === "string" ? el.className.trim() : null;
+    const href = el.href || null;
+    const type = el.type || null;
+
+    if (!text && !href && !["input", "button", "select", "textarea", "a"].includes(tag)) return;
+
+    let selector;
+    if (id) {
+      selector = `${tag}#${id}`;
+    } else {
+      const classPart = cls ? "." + cls.split(/\s+/).slice(0, 2).join(".") : "";
+      selector = tag + classPart;
+    }
+
+    nodes.push({
+      tag,
+      role,
+      text,
+      id,
+      class: cls,
+      href,
+      type,
+      depth,
+      selector,
+    });
+  };
+
+  while (queue.length && nodes.length < maxNodes) {
+    const { el, depth } = queue.shift();
+    if (!el || depth > 6) continue;
+
+    if (el !== document.body) {
+      try {
+        pushNode(el, depth);
+      } catch (_) {
+        // ignore faulty nodes
+      }
+    }
+
+    const children = el.children;
+    for (let i = 0; i < children.length && nodes.length < maxNodes; i++) {
+      queue.push({ el: children[i], depth: depth + 1 });
+    }
+  }
+
+  return {
+    title: document.title || "",
+    url: location.href || "",
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    nodes,
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SHOW_PERMISSION") {
     const banner = document.createElement("div");
@@ -141,6 +218,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ title, url, selection, element: elementInfo });
     } catch (e) {
       sendResponse({ error: e.message });
+    }
+    return true;
+  }
+  if (message.type === "GET_DOM_PREVIEW") {
+    try {
+      const preview = buildDomPreview(message.maxNodes || 80);
+      sendResponse(preview);
+    } catch (e) {
+      sendResponse({ error: e.message || String(e) });
     }
     return true;
   }
