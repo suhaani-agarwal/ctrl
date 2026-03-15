@@ -1,0 +1,9 @@
+{
+  "name": "com.ctrl.ai_agent_host",
+  "description": "Native host for the Gemini Browser AI Agent (pyautogui-based OS control).",
+  "path": "/Users/suhaaniagarwal/ctrl/native-host/ai_agent_host.py",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://aobhoafdbicgogdmlfcibdlfgeoilbki/"
+  ]
+}
