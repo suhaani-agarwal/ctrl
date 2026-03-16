@@ -40,8 +40,15 @@ function connectWebSocket(key) {
     socket.send(JSON.stringify({
       setup: {
         model: "models/gemini-2.5-flash-native-audio-latest",
-        generation_config: { response_modalities: "audio" },
-        system_instruction: {
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Aoede" }
+            }
+          }
+        },
+        systemInstruction: {
           parts: [{
             text:
               "You are a friendly voice assistant for a browser automation tool. " +

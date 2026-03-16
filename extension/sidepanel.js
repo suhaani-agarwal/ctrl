@@ -23,6 +23,9 @@ let nextStartTime = 0;
 // Prevents task completion speech from re-triggering the agentic loop
 let awaitingTaskDoneResponse = false;
 
+// Accumulates user speech transcription chunks
+let userTranscriptBuffer = "";
+
 // UI
 const transcript         = document.getElementById("transcript");
 const statusText         = document.getElementById("status-text");
@@ -135,21 +138,42 @@ function handleServerMessage(msg) {
     return;
   }
   if (msg.serverContent) {
+    // User speech transcription — accumulate for intent detection
+    if (msg.serverContent.inputTranscription) {
+      const t = msg.serverContent.inputTranscription;
+      if (t.text) {
+        userTranscriptBuffer += t.text;
+        updateTranscript("You", userTranscriptBuffer);
+      }
+    }
+
+    // Gemini speech transcription — display in transcript
+    if (msg.serverContent.outputTranscription) {
+      const t = msg.serverContent.outputTranscription;
+      if (t.text) {
+        currentAgentTurnText += t.text;
+        updateTranscript("Agent", currentAgentTurnText);
+      }
+    }
+
     const turn = msg.serverContent.modelTurn;
     if (turn?.parts) {
       for (const part of turn.parts) {
+        console.log("SP: part keys", Object.keys(part));
         if (part.text) {
           currentAgentTurnText += part.text;
           updateTranscript("Agent", currentAgentTurnText);
         }
-        if (part.inline_data?.mime_type?.includes("audio")) {
-          queueAudio(part.inline_data.data);
+        const blob = part.inlineData || part.inline_data;
+        if (blob?.mimeType?.includes("audio") || blob?.mime_type?.includes("audio")) {
+          queueAudio(blob.data);
         }
       }
     }
 
     if (msg.serverContent.turnComplete) {
-      const intentText = currentAgentTurnText.trim();
+      const intentText = (userTranscriptBuffer || currentAgentTurnText).trim();
+      userTranscriptBuffer = "";
       currentAgentTurnText = "";
 
       // Ignore Gemini's vocal response to [TASK_DONE] — don't re-trigger loop
@@ -181,6 +205,7 @@ function handleServerMessage(msg) {
     if (msg.serverContent.interrupted) {
       stopPlayback();
       currentAgentTurnText = "";
+      userTranscriptBuffer = "";
     }
   }
 }
@@ -462,7 +487,7 @@ function updateTranscript(role, text) {
   const target = isInternal ? detailsBody : transcript;
 
   const last = target?.lastElementChild;
-  if (last?.dataset.role === role && role === "Agent") {
+  if (last?.dataset.role === role && (role === "Agent" || role === "You")) {
     last.innerText = text;
   } else {
     const b = document.createElement("div");
