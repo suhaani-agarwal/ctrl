@@ -241,6 +241,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // --- Execute browser action ---
   if (message.type === "EXECUTE_ACTION") {
+    // Tab management actions are handled here — no content script needed
+    if (message.kind === "new_tab") {
+      const url = message.value && message.value.startsWith("http") ? message.value : undefined;
+      chrome.tabs.create({ url, active: true }, () => sendResponse({ success: true }));
+      return true;
+    }
+    if (message.kind === "switch_tab") {
+      chrome.tabs.query({ currentWindow: true }, (tabs) => {
+        const q = (message.value || "").toLowerCase();
+        const target = tabs.find(t =>
+          t.title?.toLowerCase().includes(q) || t.url?.toLowerCase().includes(q)
+        );
+        if (target) {
+          chrome.tabs.update(target.id, { active: true }, () => sendResponse({ success: true }));
+        } else {
+          sendResponse({ success: false, error: `No tab matching "${message.value}"` });
+        }
+      });
+      return true;
+    }
+    if (message.kind === "close_tab") {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0]) chrome.tabs.remove(tabs[0].id, () => sendResponse({ success: true }));
+        else sendResponse({ success: false, error: "No active tab" });
+      });
+      return true;
+    }
+
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       if (!tabs[0]) { sendResponse({ success: false, error: "No active tab" }); return; }
       if (tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
@@ -277,63 +305,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // --- Call Flash text model for action planning ---
-  if (message.type === "CALL_FLASH") {
-    // Convert any inline_data parts (snake_case from WS format) to inlineData (REST camelCase)
-    const restParts = (message.parts || []).map(p => {
-      if (p.inline_data) {
-        return { inlineData: { mimeType: p.inline_data.mime_type, data: p.inline_data.data } };
-      }
-      return p;
-    });
+  // --- Unified Gemini REST call (action planning + task decomposition) ---
+  if (message.type === "CALL_GEMINI") {
+    const model = message.model || "gemini-2.5-flash-lite";
+    const parts = (message.parts || [{ text: message.prompt || "" }]).map(p =>
+      p.inline_data ? { inlineData: { mimeType: p.inline_data.mime_type, data: p.inline_data.data } } : p
+    );
     const body = {
-      contents: [{ parts: restParts }],
+      contents: [{ parts }],
       generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 512,
+        temperature: message.temperature ?? 0,
+        maxOutputTokens: message.maxTokens || 512,
         responseMimeType: "application/json",
-        responseSchema: {
-          type: "object",
-          properties: {
-            thought: { type: "string" },
-            actions: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  action: {
-                    type: "string",
-                    enum: ["click", "fill", "scroll", "scrollTo", "navigate", "keypress", "select", "hover", "wait", "done"]
-                  },
-                  selector: { type: "string" },
-                  value: { type: "string" }
-                },
-                required: ["action"]
-              }
-            },
-            done: { type: "boolean" }
-          },
-          required: ["thought", "actions", "done"]
-        }
+        responseSchema: message.schema
       }
     };
     fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
     )
       .then(r => r.json())
       .then(data => {
         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!text) {
-          console.error("BG: Flash empty response, full data:", JSON.stringify(data).slice(0, 500));
-          sendResponse({ success: false, error: "Empty Flash response: " + (data?.error?.message || JSON.stringify(data?.promptFeedback || "unknown")) });
+          console.error("BG: CALL_GEMINI empty:", JSON.stringify(data).slice(0, 400));
+          sendResponse({ success: false, error: data?.error?.message || "Empty response" });
           return;
         }
-        try {
-          sendResponse({ success: true, data: JSON.parse(text) });
-        } catch (e) {
-          sendResponse({ success: false, error: "JSON parse failed: " + e.message });
-        }
+        try { sendResponse({ success: true, data: JSON.parse(text) }); }
+        catch (e) { sendResponse({ success: false, error: "JSON parse failed: " + e.message }); }
       })
       .catch(e => sendResponse({ success: false, error: e.message }));
     return true;
@@ -352,22 +352,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
     });
     return true;
-  }
-
-  // --- Speak completion via Gemini Live ---
-  if (message.type === "SPEAK_TO_GEMINI_LIVE") {
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        clientContent: {
-          turns: [{ role: "user", parts: [{ text: message.text }] }],
-          turnComplete: true
-        }
-      }));
-      sendResponse({ success: true });
-    } else {
-      sendResponse({ success: false, error: "WebSocket not open" });
-    }
-    return;
   }
 
   // --- OS action via native host ---

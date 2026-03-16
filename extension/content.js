@@ -15,6 +15,7 @@ function buildDomPreview(maxNodes = 120) {
     ...document.querySelectorAll("[role]"),
     ...document.querySelectorAll("[onclick]"),
     ...document.querySelectorAll("[tabindex]"),
+    ...document.querySelectorAll("[jsname][jsaction]"), // Google Workspace interactive elements
   ];
 
   for (const el of allInteractive) {
@@ -77,6 +78,7 @@ function describeNode(el) {
   const id = el.id;
   const ariaLabel = el.getAttribute("aria-label") || el.getAttribute("aria-labelledby") || null;
   const dataTitle = el.getAttribute("data-title") || el.getAttribute("title") || null;
+  const jsname = el.getAttribute("jsname") || null;
   const role = el.getAttribute("role") || null;
   const href = el.href || null;
   const type = el.type || null;
@@ -87,14 +89,16 @@ function describeNode(el) {
   const isInteractive = ["a","button","input","select","textarea","video"].includes(tag) || role;
   if (!hasContent && !isInteractive) return null;
 
-  // Build the best possible selector — prefer id, then aria-label, then class
+  // Build the best possible selector — prefer id, then aria-label, then jsname, then class
   let selector;
   if (id && !id.match(/^\d/) && id.length < 80) {
     selector = `${tag}#${id}`;
   } else if (ariaLabel) {
-    // aria-label selector is very reliable
     const escaped = ariaLabel.replace(/"/g, '\\"').slice(0, 60);
     selector = `${tag}[aria-label="${escaped}"]`;
+  } else if (jsname && jsname.length < 20) {
+    // Google Workspace uses jsname as stable component identifiers
+    selector = `${tag}[jsname="${jsname}"]`;
   } else {
     const cls = typeof el.className === "string"
       ? el.className.trim().split(/\s+/).filter(c => c.length > 0 && c.length < 40 && !c.match(/^\d/)).slice(0, 2).join(".")
@@ -216,35 +220,107 @@ function makeBtn(label, bg, color) {
   return b;
 }
 
+// ---- Selector resolver with fallbacks ----
+function resolveElement(selector) {
+  if (!selector || selector === "null" || selector === "") return null;
+
+  // 1. Standard CSS query
+  try {
+    const el = document.querySelector(selector);
+    if (el) return el;
+  } catch (_) {}
+
+  // 2. CSS failed (e.g. ID like ":1j" is invalid CSS) — try getElementById
+  const idMatch = selector.match(/[#\[]?([^\.\[\]#\s"=]+)\]?$/) ;
+  const rawId = selector.includes("#") ? selector.split("#").pop().split(/[\.\[: ]/)[0] : null;
+  if (rawId) {
+    const el = document.getElementById(rawId);
+    if (el) return el;
+  }
+
+  // 3. Fallback: match by aria-label or visible text
+  const textHint = selector.replace(/^[a-z\-_]+(\[aria-label=")?/i, "").replace(/"\]$/, "").trim();
+  if (textHint.length > 2) {
+    // Try aria-label match
+    const byAria = document.querySelector(`[aria-label="${textHint}"]`) ||
+                   document.querySelector(`[aria-label*="${textHint}"]`);
+    if (byAria && isVisible(byAria)) return byAria;
+
+    // Try visible text match on interactive elements
+    const candidates = document.querySelectorAll("a,button,[role='button'],[role='link'],[role='menuitem'],div[onclick]");
+    for (const c of candidates) {
+      if (!isVisible(c)) continue;
+      const t = (c.getAttribute("aria-label") || c.innerText || "").trim();
+      if (t && t.toLowerCase().includes(textHint.toLowerCase())) return c;
+    }
+  }
+
+  return null;
+}
+
 // ---- Action executor ----
 function executeAction(msg, sendResponse) {
   const { kind, selector, value } = msg;
 
   let el = null;
   if (selector && selector !== "null" && selector !== "") {
-    try { el = document.querySelector(selector); } catch (e) {
-      sendResponse({ success: false, error: "Bad selector: " + e.message });
-      return;
-    }
+    el = resolveElement(selector);
   }
 
   try {
     switch (kind) {
-      case "click":
+      case "click": {
         if (!el) { sendResponse({ success: false, error: `Element not found: ${selector}` }); return; }
         el.focus?.();
+        // Dispatch full mouse event sequence for SPA compatibility
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, cancelable: true }));
         el.click();
         sendResponse({ success: true });
         break;
+      }
 
-      case "fill":
+      case "fill": {
         if (!el) { sendResponse({ success: false, error: `Element not found: ${selector}` }); return; }
         el.focus?.();
-        el.value = value || "";
-        el.dispatchEvent(new Event("input",  { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
+        const elTag = el.tagName.toUpperCase();
+        if (elTag === "INPUT" || elTag === "TEXTAREA") {
+          // Use native setter to trigger React/Vue synthetic events
+          const proto = elTag === "TEXTAREA"
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+          const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+          if (nativeSetter) nativeSetter.call(el, value || "");
+          else el.value = value || "";
+          el.dispatchEvent(new Event("input",  { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        } else {
+          // contenteditable or canvas-based editor (Google Slides, Docs, etc.)
+          el.click?.();
+          document.execCommand("selectAll", false, null);
+          document.execCommand("insertText", false, value || "");
+        }
         sendResponse({ success: true });
         break;
+      }
+
+      case "type": {
+        // Type text into the currently focused element — for canvas editors (Google Slides/Docs)
+        // where fill cannot be used. Call after click to activate the text box.
+        const typeTarget = el || document.activeElement || document.body;
+        typeTarget.focus?.();
+        const typed = document.execCommand("insertText", false, value || "");
+        if (!typed) {
+          // Fallback: dispatch keyboard events per character
+          for (const char of (value || "")) {
+            typeTarget.dispatchEvent(new KeyboardEvent("keydown",  { key: char, bubbles: true, cancelable: true }));
+            typeTarget.dispatchEvent(new InputEvent("input", { data: char, inputType: "insertText", bubbles: true }));
+            typeTarget.dispatchEvent(new KeyboardEvent("keyup",    { key: char, bubbles: true }));
+          }
+        }
+        sendResponse({ success: true });
+        break;
+      }
 
       case "scroll":
         window.scrollBy({ top: parseInt(value) || 400, behavior: "smooth" });

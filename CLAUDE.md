@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-**ctrl** is a Chrome extension (Manifest V3) that acts as a voice-driven browser automation agent powered by the Gemini Live API. The user speaks commands; the agent understands the page and executes browser actions (click, fill, scroll, navigate) on their behalf. An optional native host enables OS-level control via pyautogui.
+**ctrl** is a Chrome extension (Manifest V3) that acts as a voice-driven browser automation agent. The user speaks commands; a two-model Gemini pipeline understands intent and executes browser actions (click, fill, scroll, navigate) on their behalf. An optional native host enables OS-level control via pyautogui.
 
 ## Setup
 
@@ -26,34 +26,44 @@ There is no build step — the extension files in `extension/` are loaded direct
 The extension has four distinct execution contexts that communicate via `chrome.runtime.sendMessage`:
 
 ### `background.js` (Service Worker)
-The central hub. Owns the persistent WebSocket connection to the Gemini Live API (`wss://generativelanguage.googleapis.com/...`). Routes all messages between other contexts:
+The central hub. Manages two Gemini connections:
+1. **WebSocket** to Gemini Live API (`gemini-2.5-flash-native-audio-latest`) — handles real-time voice conversation only; the system prompt explicitly tells it NOT to output commands
+2. **REST fetch** (`gemini-2.5-flash-lite`) — used by `CALL_GEMINI` messages for action planning and task decomposition, always returns structured JSON via `responseSchema`
+
+Other responsibilities:
 - Forwards audio chunks from offscreen → Gemini WebSocket
 - Relays Gemini responses → side panel
 - Handles DOM preview and screenshot capture requests from the side panel
 - Dispatches browser actions to the content script
 - Connects to the native host via `chrome.runtime.connectNative("com.ctrl.ai_agent_host")`
+- Auto-reconnects WebSocket up to 3 times on non-auth failures
 
 ### `sidepanel.js` (Side Panel UI)
-The user-facing interface. On mic button press:
-1. Captures a DOM preview + JPEG screenshot of the current tab
-2. Sends both to Gemini as context
-3. Starts microphone capture via offscreen document
-4. Receives Gemini's text+audio response
-5. Parses `ACTION:kind:selector:value` lines from the response text
-6. Runs `runActionFlow()` — shows a permission banner, captures before/after screenshots, executes the action, and feeds results back to Gemini
+The user-facing interface and agentic loop controller. On mic button press, it starts microphone capture. When Gemini's voice transcription detects actionable intent (`hasActionableIntent()`), it runs `runAgenticLoop()`:
 
-Action parsing has two layers:
-- **Primary**: regex matching for explicit `ACTION:` lines
-- **Fallback**: `inferActionFromText()` for natural language (navigate, click N-refs, fill)
+1. **`planTask()`** — calls Flash REST to decompose the goal into 1–5 ordered steps
+2. **Per-step loop** (up to `MAX_ROUNDS=15` rounds per step):
+   - Captures DOM preview + JPEG screenshot of the current tab
+   - Calls Flash REST via `buildFlashPrompt()` → returns `{ thought, actions[], done }` JSON
+   - Shows the `thought` in a collapsible details panel
+   - For `fill` actions: shows a permission banner (auto-denies after 15s unless approved)
+   - Executes each action, tracks `failedSelectors` to avoid retries
+   - Feeds `[TASK_DONE]` back to Gemini Live when complete (voice assistant then summarizes)
+
+Key constants: `MAX_ROUNDS=15`, `MAX_DOM_NODES=100`, `SETTLE_MS=150`, `NAVIGATE_SETTLE_MS=1200`
+
+`SENSITIVE_ACTIONS` = `{ "fill" }` — these always require user permission.
 
 ### `offscreen.js` (Offscreen Document)
 Has `getUserMedia` access. Captures mic audio at 16kHz using an AudioWorklet (`audio-processor.js`), converts float32 → PCM16 → base64, and sends chunks to background.
 
 ### `content.js` (Content Script, all URLs)
 Injected into every page. Handles:
-- `GET_DOM_PREVIEW`: Builds a structured list of interactive/visible elements with CSS selectors optimized for reliability (prefers `id`, then `aria-label`, then class). Uses three strategies: interactive elements first, then headings/context elements, then BFS traversal.
-- `EXECUTE`: Performs click/fill/scroll/scrollTo/navigate/focus actions
+- `GET_DOM_PREVIEW`: Builds a structured list of interactive/visible elements with CSS selectors. Uses three strategies: interactive elements first, then headings/context elements, then BFS traversal.
+- `EXECUTE`: Performs click/fill/scroll/scrollTo/navigate/keypress/select/hover/wait actions
 - `SHOW_PERMISSION`: Injects a permission banner at the top of the page (auto-denies after 15s)
+- `READY_CHECK`: Returns page load state (used after navigation to detect settle)
+- `PING`: Responds to confirm content script is alive (background uses this before injecting)
 
 ### `native-host/ai_agent_host.py` (Optional Native Host)
 A Python process Chrome spawns via Native Messaging (stdio). Provides OS-level actions via pyautogui: click, double_click, right_click, move, drag, type, hotkey, scroll, screenshot (via mss), open_app, get_screen_size.
@@ -62,22 +72,36 @@ A Python process Chrome spawns via Native Messaging (stdio). Provides OS-level a
 
 | Type | Direction | Purpose |
 |------|-----------|---------|
-| `CONNECT_WEBSOCKET` | panel → bg | Connect/reconnect to Gemini with API key |
-| `SEND_TO_GEMINI` | panel → bg | Forward a Gemini API message object |
+| `CONNECT_WEBSOCKET` | panel → bg | Connect/reconnect to Gemini Live with API key |
+| `SEND_TO_GEMINI` | panel → bg | Forward a message object to the Live WebSocket |
+| `CALL_GEMINI` | panel → bg | REST call to Flash for action planning (returns JSON) |
 | `START_MIC` / `STOP_MIC` | panel → bg | Start/stop mic capture via offscreen |
 | `CAPTURE_SCREEN` | panel → bg | Get JPEG screenshot of active tab |
 | `GET_DOM_PREVIEW` | panel → bg → content | Get structured DOM node list |
 | `EXECUTE_ACTION` | panel → bg → content | Execute a browser action |
 | `SHOW_PERMISSION` | panel → bg → content | Show allow/deny banner on page |
+| `READY_CHECK` | panel → bg → content | Check if page has finished loading |
 | `OS_ACTION` | panel → bg → native | Perform OS-level action |
 | `AUDIO_CHUNK` | offscreen → bg | PCM16 base64 audio to stream to Gemini |
 
 ## Gemini Integration
 
-- Model: `gemini-2.5-flash-native-audio-latest` (supports real-time audio I/O)
+Two separate Gemini models are used:
+
+**Gemini Live (WebSocket)** — voice conversation only
+- Model: `gemini-2.5-flash-native-audio-latest`
+- Voice: "Aoede"
 - Audio in: PCM 16kHz, streamed as `realtimeInput.mediaChunks`
 - Audio out: PCM 24kHz, decoded and played via Web Audio API with a queue (`nextStartTime`)
-- The system prompt instructs Gemini to output `ACTION:kind:selector:value` lines on their own line without markdown formatting
+- System prompt tells it to be a friendly voice assistant — it must NOT output commands or structured data
+- Receives `[TASK_DONE] ...` messages from the side panel and summarizes what was accomplished
+
+**Gemini Flash (REST)** — action planning and task decomposition
+- Model: `gemini-2.5-flash-lite` (default for `CALL_GEMINI`)
+- Called synchronously via `fetch` from background service worker
+- Always uses `responseMimeType: "application/json"` + `responseSchema` for typed output
+- `planTask()`: returns `{ steps: string[], start_url?: string }`
+- Per-round planning: returns `{ thought: string, actions: Action[], done: boolean }`
 
 ## DOM Selector Strategy
 
