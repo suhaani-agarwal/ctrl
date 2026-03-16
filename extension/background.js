@@ -44,23 +44,18 @@ function connectWebSocket(key) {
         system_instruction: {
           parts: [{
             text:
-              "You are a browser AI agent with eyes on the user\'s screen. You receive:\n" +
-              "1. A DOM_PREVIEW listing interactive elements as N1, N2, N3... with their selectors\n" +
-              "2. Screenshots of the current page\n\n" +
-              "CRITICAL RULES:\n" +
-              "- When the user asks you to do something on the page, you MUST output an ACTION line\n" +
-              "- OUTPUT THE ACTION LINE ON ITS OWN LINE, no backticks, no markdown\n" +
-              "- Use EXACTLY this format (case sensitive, colons only as separators):\n" +
-              "ACTION:click:SELECTOR\n" +
-              "ACTION:fill:SELECTOR:TEXT TO TYPE\n" +
-              "ACTION:scroll::500\n" +
-              "ACTION:navigate::https://example.com\n" +
-              "ACTION:scrollTo:SELECTOR\n\n" +
-              "- Use the selector from the DOM_PREVIEW (e.g. input#search, button.submit)\n" +
-              "- You can also use N1, N2 etc from the DOM_PREVIEW as shorthand selectors\n" +
-              "- ALWAYS speak naturally about what you are doing AND include the ACTION line\n" +
-              "- If the user says \'click the search bar\' or \'go to YouTube\' — OUTPUT AN ACTION LINE\n" +
-              "- Never say you cannot perform actions. You CAN. Just output the ACTION line."
+              "You are a friendly voice assistant for a browser automation tool. " +
+              "The user speaks tasks; a separate system executes them in the browser.\n\n" +
+              "WHEN the user speaks a task:\n" +
+              "- Acknowledge in one short, natural sentence. Be warm, not robotic.\n" +
+              "- Do NOT describe what steps you will take.\n" +
+              "- Do NOT output commands, structured data, or ACTION lines.\n\n" +
+              "WHEN you receive a message starting with [TASK_DONE]:\n" +
+              "- Summarize what was accomplished in 1-2 natural, friendly sentences.\n" +
+              "- Example: 'Done! I searched for cats and opened the top result.'\n" +
+              "- Do NOT repeat the raw data or say 'TASK_DONE'.\n\n" +
+              "If the user says 'stop' or 'cancel', acknowledge briefly.\n" +
+              "If the user gives a new instruction mid-task, acknowledge the change."
           }]
         }
       }
@@ -95,6 +90,29 @@ function connectWebSocket(key) {
 
 function broadcastToPanel(msg) {
   chrome.runtime.sendMessage(msg).catch(() => {});
+}
+
+// Inject content.js into a tab if it hasn't loaded yet (e.g. after extension reload)
+function ensureContentScript(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { type: "PING" }, (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        chrome.scripting.executeScript(
+          { target: { tabId }, files: ["content.js"] },
+          () => {
+            if (chrome.runtime.lastError) {
+              console.warn("BG: could not inject content script:", chrome.runtime.lastError.message);
+              resolve(false);
+            } else {
+              resolve(true);
+            }
+          }
+        );
+      } else {
+        resolve(true);
+      }
+    });
+  });
 }
 
 // ---- Offscreen document for mic ----
@@ -153,6 +171,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "STOP_MIC") {
     chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_MIC" }).catch(() => {});
     setTimeout(() => closeOffscreen(), 500);
+    // Tell Gemini we stopped sending audio
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        clientContent: { turns: [], turnComplete: true }
+      }));
+    }
     sendResponse({ success: true });
     return;
   }
@@ -183,7 +207,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // --- Screen capture ---
   if (message.type === "CAPTURE_SCREEN") {
-    chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 60 }, (dataUrl) => {
+    chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 75 }, (dataUrl) => {
       if (chrome.runtime.lastError || !dataUrl) {
         sendResponse({ success: false, error: chrome.runtime.lastError?.message });
         return;
@@ -195,11 +219,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // --- DOM preview ---
   if (message.type === "GET_DOM_PREVIEW") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (!tabs[0] || tabs[0].url.startsWith("chrome://")) {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
         sendResponse({ nodes: [], title: "", url: "" });
         return;
       }
+      await ensureContentScript(tabs[0].id);
       chrome.tabs.sendMessage(tabs[0].id, { type: "GET_DOM_PREVIEW", maxNodes: message.maxNodes || 60 }, (resp) => {
         sendResponse(resp || { nodes: [], title: "", url: "" });
       });
@@ -209,8 +234,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // --- Execute browser action ---
   if (message.type === "EXECUTE_ACTION") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       if (!tabs[0]) { sendResponse({ success: false, error: "No active tab" }); return; }
+      if (tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
+        sendResponse({ success: false, error: "Cannot execute on chrome:// pages" }); return;
+      }
+      await ensureContentScript(tabs[0].id);
       chrome.tabs.sendMessage(
         tabs[0].id,
         { type: "EXECUTE", kind: message.kind, selector: message.selector, value: message.value },
@@ -228,16 +257,110 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // --- Permission banner ---
   if (message.type === "SHOW_PERMISSION") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (!tabs[0] || tabs[0].url.startsWith("chrome://")) {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
         sendResponse("GRANT"); // auto-grant if we can't show banner
         return;
       }
+      await ensureContentScript(tabs[0].id);
       chrome.tabs.sendMessage(tabs[0].id, { type: "SHOW_PERMISSION", description: message.description }, (resp) => {
         sendResponse(chrome.runtime.lastError ? "DENY" : (resp || "DENY"));
       });
     });
     return true;
+  }
+
+  // --- Call Flash text model for action planning ---
+  if (message.type === "CALL_FLASH") {
+    // Convert any inline_data parts (snake_case from WS format) to inlineData (REST camelCase)
+    const restParts = (message.parts || []).map(p => {
+      if (p.inline_data) {
+        return { inlineData: { mimeType: p.inline_data.mime_type, data: p.inline_data.data } };
+      }
+      return p;
+    });
+    const body = {
+      contents: [{ parts: restParts }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 512,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "object",
+          properties: {
+            thought: { type: "string" },
+            actions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  action: {
+                    type: "string",
+                    enum: ["click", "fill", "scroll", "scrollTo", "navigate", "keypress", "select", "hover", "wait", "done"]
+                  },
+                  selector: { type: "string" },
+                  value: { type: "string" }
+                },
+                required: ["action"]
+              }
+            },
+            done: { type: "boolean" }
+          },
+          required: ["thought", "actions", "done"]
+        }
+      }
+    };
+    fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    )
+      .then(r => r.json())
+      .then(data => {
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          console.error("BG: Flash empty response, full data:", JSON.stringify(data).slice(0, 500));
+          sendResponse({ success: false, error: "Empty Flash response: " + (data?.error?.message || JSON.stringify(data?.promptFeedback || "unknown")) });
+          return;
+        }
+        try {
+          sendResponse({ success: true, data: JSON.parse(text) });
+        } catch (e) {
+          sendResponse({ success: false, error: "JSON parse failed: " + e.message });
+        }
+      })
+      .catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  // --- Page ready check (for smart settle after navigation) ---
+  if (message.type === "READY_CHECK") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
+        sendResponse({ ready: false });
+        return;
+      }
+      await ensureContentScript(tabs[0].id);
+      chrome.tabs.sendMessage(tabs[0].id, { type: "READY_CHECK" }, (resp) => {
+        sendResponse(chrome.runtime.lastError ? { ready: false } : (resp || { ready: false }));
+      });
+    });
+    return true;
+  }
+
+  // --- Speak completion via Gemini Live ---
+  if (message.type === "SPEAK_TO_GEMINI_LIVE") {
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text: message.text }] }],
+          turnComplete: true
+        }
+      }));
+      sendResponse({ success: true });
+    } else {
+      sendResponse({ success: false, error: "WebSocket not open" });
+    }
+    return;
   }
 
   // --- OS action via native host ---

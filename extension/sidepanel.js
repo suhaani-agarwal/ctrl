@@ -4,18 +4,38 @@ let isListening = false;
 let currentAgentTurnText = "";
 let lastDomNodes = [];
 
+// Agentic loop state
+let loopRunning = false;
+let loopAborted = false;
+let currentLoopId = 0;
+let pendingUserInterrupt = null;
+let taskAutoApproved = false;
+const MAX_ROUNDS = 15;
+const SETTLE_MS = 150;
+const NAVIGATE_SETTLE_MS = 1200;
+const MAX_DOM_NODES = 100;
+const SENSITIVE_ACTIONS = new Set(["navigate", "fill", "keypress", "select"]);
+
 // Audio playback
 let playbackContext = null;
 let nextStartTime = 0;
 
+// Prevents task completion speech from re-triggering the agentic loop
+let awaitingTaskDoneResponse = false;
+
 // UI
-const transcript    = document.getElementById("transcript");
-const statusText    = document.getElementById("status-text");
-const micBtn        = document.getElementById("mic-btn");
-const settingsToggle = document.getElementById("settings-toggle");
-const settingsPanel = document.getElementById("settings-panel");
-const apiKeyInput   = document.getElementById("api-key");
+const transcript         = document.getElementById("transcript");
+const statusText         = document.getElementById("status-text");
+const micBtn             = document.getElementById("mic-btn");
+const settingsToggle     = document.getElementById("settings-toggle");
+const settingsPanel      = document.getElementById("settings-panel");
+const apiKeyInput        = document.getElementById("api-key");
 const screenshotIndicator = document.getElementById("screenshot-indicator");
+const screenshotThumb    = document.getElementById("screenshot-thumb");
+const actionBadges       = document.getElementById("action-badges");
+const detailsToggle      = document.getElementById("details-toggle");
+const detailsBody        = document.getElementById("details-body");
+const pagePreview        = document.getElementById("page-preview");
 
 // ---- Init ----
 chrome.storage.sync.get(["gemini_api_key"], (result) => {
@@ -31,6 +51,16 @@ chrome.storage.sync.get(["gemini_api_key"], (result) => {
 });
 
 settingsToggle.onclick = () => settingsPanel.classList.toggle("hidden");
+
+detailsToggle.onclick = () => {
+  const open = detailsBody.classList.toggle("hidden");
+  detailsToggle.textContent = open ? "Details ▸" : "Details ▾";
+  if (!open) detailsBody.scrollTop = detailsBody.scrollHeight;
+};
+
+screenshotThumb?.addEventListener("click", () => {
+  screenshotThumb.classList.toggle("expanded");
+});
 
 apiKeyInput.onchange = (e) => {
   apiKey = e.target.value.trim();
@@ -59,7 +89,7 @@ chrome.runtime.onMessage.addListener((message) => {
     statusText.innerText = "Mic error: " + message.error;
   }
   if (message.type === "MIC_CHUNK_SENT") {
-    // small visual pulse — ignore errors
+    // small visual pulse
   }
   if (message.type === "SERVER_MESSAGE") {
     try { handleServerMessage(JSON.parse(message.data)); } catch (e) {}
@@ -74,8 +104,14 @@ micBtn.onclick = async () => {
   }
   if (playbackContext.state === "suspended") await playbackContext.resume();
 
+  // Cancel any running agentic loop
+  if (loopRunning) {
+    loopAborted = true;
+    currentLoopId++;
+    updateTranscript("System", "Cancelling current task...");
+  }
+
   if (isListening) {
-    // Stop
     isListening = false;
     micBtn.classList.remove("listening");
     statusText.innerText = "Ready";
@@ -83,58 +119,7 @@ micBtn.onclick = async () => {
     return;
   }
 
-  // Send DOM preview + screenshot so agent can see AND understand the page
-  statusText.innerText = "Reading page...";
-  try {
-    const [preview, shot] = await Promise.all([
-      msgBg({ type: "GET_DOM_PREVIEW", maxNodes: 120 }),
-      msgBg({ type: "CAPTURE_SCREEN" })
-    ]);
-
-    if (preview?.nodes?.length) {
-      lastDomNodes = preview.nodes;
-    }
-
-    const parts = [];
-
-    // Build DOM text summary
-    if (preview?.nodes?.length) {
-      const lines = preview.nodes.slice(0, 80).map((n, i) => {
-        const bits = [`N${i+1}`];
-        if (n.tag) bits.push(`tag=${n.tag}`);
-        if (n.role) bits.push(`role=${n.role}`);
-        if (n.ariaLabel) bits.push(`label="${n.ariaLabel}"`);
-        if (n.text && n.text !== n.ariaLabel) bits.push(`text="${n.text.slice(0,60)}"`);
-        if (n.href) bits.push(`href=${n.href.slice(0,60)}`);
-        bits.push(`sel=${n.selector}`);
-        return bits.join(" | ");
-      });
-      const domText =
-        `Page: ${preview.title}\nURL: ${preview.url}\nScrollY: ${preview.scrollY}\n` +
-        `DOM_PREVIEW (use these selectors for actions):\n` + lines.join("\n");
-      parts.push({ text: domText });
-    }
-
-    // Add screenshot so agent can visually confirm what it sees
-    if (shot?.success && shot.data) {
-      parts.push({ inline_data: { mime_type: "image/jpeg", data: shot.data } });
-      parts.push({ text: "^ This is a screenshot of the current page. Use the DOM_PREVIEW selectors above for actions." });
-    }
-
-    if (parts.length) {
-      chrome.runtime.sendMessage({
-        type: "SEND_TO_GEMINI",
-        data: {
-          clientContent: {
-            turns: [{ role: "user", parts }],
-            turnComplete: true
-          }
-        }
-      });
-    }
-  } catch (e) { console.warn("Page context failed", e); }
-
-  // Start mic
+  // Start mic — Flash handles page context, no need to send DOM/screenshot to Live
   statusText.innerText = "Starting mic...";
   chrome.runtime.sendMessage({ type: "START_MIC" });
 };
@@ -162,12 +147,36 @@ function handleServerMessage(msg) {
         }
       }
     }
-    // Parse actions only on full turn — avoids broken partial chunk matches
+
     if (msg.serverContent.turnComplete) {
-      console.log("Full agent turn:", currentAgentTurnText);
-      if (currentAgentTurnText) parseAndExecuteActions(currentAgentTurnText);
-      statusText.innerText = isListening ? "Listening..." : "Ready";
+      const intentText = currentAgentTurnText.trim();
       currentAgentTurnText = "";
+
+      // Ignore Gemini's vocal response to [TASK_DONE] — don't re-trigger loop
+      if (awaitingTaskDoneResponse) {
+        awaitingTaskDoneResponse = false;
+        if (!loopRunning) statusText.innerText = isListening ? "Listening..." : "Ready";
+        return;
+      }
+
+      if (intentText) {
+        if (loopRunning) {
+          const lower = intentText.toLowerCase();
+          if (lower.includes("stop") || lower.includes("cancel") || lower.includes("never mind")) {
+            loopAborted = true;
+            currentLoopId++;
+            updateTranscript("System", "Stopping task.");
+          } else {
+            pendingUserInterrupt = intentText;
+            updateTranscript("System", "Updating task...");
+          }
+        } else if (hasActionableIntent(intentText)) {
+          runAgenticLoop(intentText);
+        }
+      }
+      if (!loopRunning) {
+        statusText.innerText = isListening ? "Listening..." : "Ready";
+      }
     }
     if (msg.serverContent.interrupted) {
       stopPlayback();
@@ -176,127 +185,298 @@ function handleServerMessage(msg) {
   }
 }
 
-// ---- Action parsing ----
-// Runs on the FULL turn text after turnComplete — avoids partial chunk failures
-function parseAndExecuteActions(text) {
-  console.log("Parsing actions from full turn:", text.slice(0, 300));
+// ---- Intent detection ----
+function hasActionableIntent(text) {
+  const actionWords = [
+    "click", "navigate", "go to", "open", "scroll", "type", "search",
+    "fill", "press", "select", "submit", "play", "pause", "like",
+    "subscribe", "watch", "create", "make", "write", "delete", "close",
+    "new", "sign in", "log in", "download", "upload", "send", "reply",
+    "got it", "sure", "i'll", "heading to", "searching", "navigating",
+    "opening", "clicking", "i will", "let me", "going to"
+  ];
+  const lower = text.toLowerCase();
+  return actionWords.some(w => lower.includes(w));
+}
 
-  // Strip markdown backticks Gemini sometimes wraps around actions
-  const cleaned = text.replace(/`{1,3}/g, "");
+// ---- Agentic Loop ----
+async function runAgenticLoop(intentText) {
+  if (loopRunning) return;
+  loopRunning = true;
+  loopAborted = false;
+  taskAutoApproved = false;
+  pendingUserInterrupt = null;
+  const loopId = ++currentLoopId;
+  const actionHistory = [];
 
-  // Very permissive regex: handles spaces around colons, mixed case, etc.
-  const re = /ACTION\s*:\s*([\w]+)\s*:\s*([^:\n\r]*?)\s*(?::\s*([^\n\r]*))?$/gim;
-  let m;
-  let found = 0;
+  // Reset per-task UI
+  if (actionBadges) actionBadges.innerHTML = "";
+  if (screenshotThumb) { screenshotThumb.src = ""; screenshotThumb.classList.remove("expanded"); }
+  if (pagePreview) pagePreview.classList.add("hidden");
 
-  while ((m = re.exec(cleaned)) !== null) {
-    const kind   = m[1].trim().toLowerCase();
-    let selector = (m[2] || "").trim();
-    const value  = (m[3] || "").trim() || null;
+  statusText.innerText = "Planning actions...";
+  updateTranscript("System", "Task: " + intentText.slice(0, 120));
 
-    // For scroll/navigate the selector field is empty — that's fine
-    if (!selector || selector === "null") {
-      if (kind !== "scroll" && kind !== "navigate") {
-        console.warn("Skipping action — empty selector for kind:", kind);
-        continue;
+  try {
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      // Check abort
+      if (loopAborted || loopId !== currentLoopId) {
+        updateTranscript("System", "Task cancelled.");
+        break;
       }
-      selector = null;
-    }
 
-    // Resolve N1/N2 index shorthand from DOM preview
-    if (selector) {
-      const idxMatch = selector.match(/^N(\d+)$/i);
-      if (idxMatch) {
-        const node = lastDomNodes[parseInt(idxMatch[1]) - 1];
-        if (node?.selector) {
-          console.log("Resolved", selector, "->", node.selector);
-          selector = node.selector;
+      // Check for user interrupt — update intent
+      if (pendingUserInterrupt) {
+        intentText = pendingUserInterrupt;
+        pendingUserInterrupt = null;
+        updateTranscript("System", "New task: " + intentText.slice(0, 120));
+      }
+
+      // 1. Capture current page state
+      statusText.innerText = `Round ${round + 1}: Reading page...`;
+      const [preview, shot] = await Promise.all([
+        msgBg({ type: "GET_DOM_PREVIEW", maxNodes: MAX_DOM_NODES }),
+        msgBg({ type: "CAPTURE_SCREEN" })
+      ]);
+      if (preview?.nodes) lastDomNodes = preview.nodes;
+
+      // Show live screenshot thumbnail
+      if (shot?.success && shot.data && screenshotThumb) {
+        screenshotThumb.src = "data:image/jpeg;base64," + shot.data;
+        pagePreview?.classList.remove("hidden");
+      }
+
+      // 2. Build prompt and call Flash
+      statusText.innerText = `Round ${round + 1}: Planning...`;
+      const parts = buildFlashPrompt(intentText, preview, shot, actionHistory);
+      const result = await msgBg({ type: "CALL_FLASH", parts });
+
+      if (!result?.success || !result.data) {
+        console.error("Flash call failed:", result?.error);
+        if (round < MAX_ROUNDS - 1) {
+          await delay(1000);
+          continue;
+        }
+        updateTranscript("System", "Planning failed: " + (result?.error || "unknown"));
+        break;
+      }
+
+      const plan = result.data;
+      console.log(`Round ${round + 1}:`, plan);
+
+      // 3. Check if done
+      if (plan.done || (plan.actions.length === 1 && plan.actions[0].action === "done")) {
+        const summary = buildCompletionSummary(intentText, actionHistory, plan.thought);
+        updateTranscript("System", "Complete: " + (plan.thought || "Done"));
+        awaitingTaskDoneResponse = true;
+        msgBg({ type: "SPEAK_TO_GEMINI_LIVE", text: `[TASK_DONE] ${summary}` });
+        break;
+      }
+
+      // 4. Execute each action in the batch
+      let hadScreenChange = false;
+      for (const step of plan.actions) {
+        if (loopAborted || loopId !== currentLoopId) break;
+
+        if (step.action === "wait") {
+          statusText.innerText = `Round ${round + 1}: Waiting for page...`;
+          await delay(1500);
+          continue;
+        }
+        if (step.action === "done") {
+          break;
+        }
+
+        // Resolve N-index shorthand
+        let sel = step.selector || null;
+        if (sel) {
+          const nMatch = sel.match(/^N(\d+)$/i);
+          if (nMatch) {
+            const node = lastDomNodes[parseInt(nMatch[1]) - 1];
+            if (node?.selector) sel = node.selector;
+          }
+        }
+
+        const desc = humanDesc(step.action, sel, step.value);
+        statusText.innerText = desc;
+        updateTranscript("Action", desc);
+
+        // Permission: ask once per task, only for sensitive actions
+        if (!taskAutoApproved) {
+          taskAutoApproved = true;
+          if (SENSITIVE_ACTIONS.has(step.action)) {
+            const permission = await msgBg({ type: "SHOW_PERMISSION", description: desc });
+            if (permission !== "GRANT") {
+              updateTranscript("System", "Action denied. Stopping.");
+              awaitingTaskDoneResponse = true;
+              msgBg({ type: "SPEAK_TO_GEMINI_LIVE", text: "[TASK_DONE] The user denied the action, so I stopped." });
+              loopAborted = true;
+              break;
+            }
+          }
+        }
+
+        // Execute
+        const execResult = await msgBg({
+          type: "EXECUTE_ACTION",
+          kind: step.action,
+          selector: sel,
+          value: step.value || null
+        });
+
+        console.log("Action result:", step.action, sel, execResult);
+
+        // Record history
+        actionHistory.push({
+          step: actionHistory.length + 1,
+          action: step.action,
+          selector: sel,
+          value: step.value,
+          success: execResult?.success || false,
+          error: execResult?.error || null
+        });
+        if (actionHistory.length > 5) actionHistory.shift();
+
+        // Add action badge to UI
+        addActionBadge(step.action, execResult?.success !== false);
+
+        // Determine if this action changes the screen
+        const isScreenChange = ["navigate", "click"].includes(step.action);
+        if (isScreenChange) hadScreenChange = true;
+
+        // Settle: smart wait after navigation, short delay otherwise
+        if (isScreenChange) {
+          await delay(600);
+          const readyCheck = await msgBg({ type: "READY_CHECK" });
+          if (!readyCheck?.ready) await delay(600);
+        } else {
+          await delay(20);
         }
       }
+
+      // Abort check after batch
+      if (loopAborted || loopId !== currentLoopId) {
+        updateTranscript("System", "Task cancelled.");
+        break;
+      }
+
+      // Wait for page to settle after batch
+      if (!hadScreenChange) {
+        await delay(SETTLE_MS);
+      }
     }
-
-    found++;
-    console.log("ACTION found:", { kind, selector, value });
-    runActionFlow(kind, selector, value, humanDesc(kind, selector, value));
-  }
-
-  if (found === 0) {
-    console.log("No ACTION lines detected in agent response");
+  } catch (e) {
+    console.error("Agentic loop error:", e);
+    updateTranscript("System", "Error: " + e.message);
+  } finally {
+    loopRunning = false;
+    taskAutoApproved = false;
+    statusText.innerText = isListening ? "Listening..." : "Ready";
   }
 }
 
+// ---- Flash prompt builder ----
+function buildFlashPrompt(intent, preview, screenshot, history) {
+  const parts = [];
+  let text = `You are a browser automation agent. You receive the user's task, the current page state, and action history. Return a batch of actions to perform on the CURRENT page.
+
+TASK: "${intent.slice(0, 400)}"
+
+`;
+
+  if (history.length > 0) {
+    text += "RECENT ACTIONS:\n";
+    for (const h of history) {
+      text += `- Step ${h.step}: ${h.action}`;
+      if (h.selector) text += ` on "${h.selector}"`;
+      if (h.value) text += ` value="${h.value}"`;
+      text += h.success ? " [OK]" : ` [FAILED: ${h.error}]`;
+      text += "\n";
+    }
+    text += "\n";
+  }
+
+  if (preview?.nodes?.length) {
+    const lines = preview.nodes.slice(0, MAX_DOM_NODES).map((n, i) => {
+      const bits = [`N${i + 1}`];
+      if (n.tag) bits.push(n.tag);
+      if (n.role) bits.push(`role=${n.role}`);
+      if (n.ariaLabel) bits.push(`label="${n.ariaLabel.slice(0, 50)}"`);
+      if (n.text && n.text !== n.ariaLabel) bits.push(`text="${n.text.slice(0, 40)}"`);
+      if (n.href) bits.push(`href=${n.href.slice(0, 50)}`);
+      if (n.placeholder) bits.push(`ph="${n.placeholder}"`);
+      if (n.type) bits.push(`type=${n.type}`);
+      bits.push(`sel="${n.selector}"`);
+      return bits.join(" | ");
+    });
+    text += `PAGE: ${preview.title}\nURL: ${preview.url}\nScroll: ${preview.scrollY}/${preview.pageHeight}\n`;
+    text += "DOM ELEMENTS:\n" + lines.join("\n") + "\n\n";
+  }
+
+  text += `RULES:
+- Return multiple actions that work on the CURRENT page state
+- If an action will change the page (navigate, form submit, click a link), make it the LAST action in the batch
+- selector MUST be copied EXACTLY from the DOM ELEMENTS list above (the sel= value)
+- Use "navigate" to go to a new URL
+- Use "keypress" with value "Enter", "Tab", "Escape", etc. for keyboard actions
+- Use "select" with selector and value for dropdown options
+- Use "hover" to trigger hover menus
+- Set done=true when the task is fully complete or you cannot proceed
+- If an action failed, try a different selector or approach
+- Be efficient — batch as many actions as possible for the current page`;
+
+  parts.push({ text });
+
+  if (screenshot?.success && screenshot.data) {
+    parts.push({ inlineData: { mimeType: "image/jpeg", data: screenshot.data } });
+  }
+
+  return parts;
+}
+
+// ---- Helpers ----
 function humanDesc(kind, selector, value) {
   switch (kind) {
-    case "click":    return `click on "${selector}"`;
-    case "fill":     return `type "${value}" into "${selector}"`;
-    case "scroll":   return `scroll by ${value} pixels`;
-    case "scrollto": return `scroll to "${selector}"`;
-    case "navigate": return `navigate to ${value}`;
+    case "click":    return `Click "${selector}"`;
+    case "fill":     return `Type "${value}" into "${selector}"`;
+    case "scroll":   return `Scroll by ${value}px`;
+    case "scrollto":
+    case "scrollTo": return `Scroll to "${selector}"`;
+    case "navigate": return `Navigate to ${value}`;
+    case "keypress": return `Press ${value}`;
+    case "select":   return `Select "${value}" in "${selector}"`;
+    case "hover":    return `Hover over "${selector}"`;
+    case "wait":     return "Waiting...";
     default:         return `${kind} on ${selector}`;
   }
 }
 
-async function runActionFlow(kind, selector, value, desc) {
-  statusText.innerText = "Waiting for permission...";
-
-  const permission = await msgBg({ type: "SHOW_PERMISSION", description: desc });
-  if (permission !== "GRANT") {
-    chrome.runtime.sendMessage({
-      type: "SEND_TO_GEMINI",
-      data: { clientContent: { turns: [{ role: "user", parts: [{ text: "User denied that action." }] }], turnComplete: true } }
-    });
-    statusText.innerText = isListening ? "Listening..." : "Ready";
-    return;
-  }
-
-  // Capture screenshot for context
-  screenshotIndicator?.classList.add("active");
-  const shot = await msgBg({ type: "CAPTURE_SCREEN" });
-  if (shot?.success && shot.data) {
-    chrome.runtime.sendMessage({
-      type: "SEND_TO_GEMINI",
-      data: {
-        clientContent: {
-          turns: [{ role: "user", parts: [
-            { text: "Current page screenshot:" },
-            { inline_data: { mime_type: "image/jpeg", data: shot.data } }
-          ]}],
-          turnComplete: true
-        }
-      }
-    });
-  }
-
-  // Execute in browser
-  const result = await msgBg({ type: "EXECUTE_ACTION", kind, selector, value });
-  screenshotIndicator?.classList.remove("active");
-  console.log("Action result:", result);
-
-  const feedback = result?.success
-    ? `Done: ${desc}`
-    : `Failed to ${desc}. Error: ${result?.error}`;
-
-  chrome.runtime.sendMessage({
-    type: "SEND_TO_GEMINI",
-    data: { clientContent: { turns: [{ role: "user", parts: [{ text: feedback }] }], turnComplete: true } }
-  });
-
-  statusText.innerText = isListening ? "Listening..." : "Ready";
+function delay(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ---- Transcript ----
 function updateTranscript(role, text) {
-  const last = transcript.lastElementChild;
+  // Route internal status messages to the details section, not the main transcript
+  const isInternal = role === "Action" || role === "System";
+  const target = isInternal ? detailsBody : transcript;
+
+  const last = target?.lastElementChild;
   if (last?.dataset.role === role && role === "Agent") {
-    last.innerText = `${role}: ${text}`;
+    last.innerText = text;
   } else {
     const b = document.createElement("div");
     b.className = `bubble ${role.toLowerCase()}`;
     b.dataset.role = role;
-    b.innerText = `${role}: ${text}`;
-    transcript.appendChild(b);
+    b.innerText = isInternal ? `${role}: ${text}` : text;
+    target?.appendChild(b);
   }
-  transcript.scrollTop = transcript.scrollHeight;
+
+  if (isInternal) {
+    detailsBody?.scrollTo({ top: detailsBody.scrollHeight });
+  } else {
+    transcript.scrollTop = transcript.scrollHeight;
+  }
 }
 
 // ---- Audio playback ----
@@ -322,6 +502,36 @@ function queueAudio(base64) {
 
 function stopPlayback() {
   if (playbackContext) nextStartTime = playbackContext.currentTime;
+}
+
+// ---- Action badge ----
+function addActionBadge(action, success) {
+  if (!actionBadges) return;
+  const icons = {
+    navigate: "↗", click: "↖", fill: "✏", scroll: "↕",
+    keypress: "⌨", select: "▾", hover: "◎", scrollTo: "⤵", scrollto: "⤵"
+  };
+  const badge = document.createElement("span");
+  badge.className = "action-badge" + (success ? "" : " failed");
+  badge.textContent = (icons[action] || "•") + " " + action;
+  actionBadges.appendChild(badge);
+  // Keep only last 10 badges visible
+  while (actionBadges.children.length > 10) actionBadges.removeChild(actionBadges.firstChild);
+}
+
+// ---- Completion summary for voice ----
+function buildCompletionSummary(intentText, actionHistory, planThought) {
+  if (planThought) return planThought;
+  const actions = actionHistory.map(h => {
+    if (h.action === "navigate") return `navigated to ${(h.value || "").slice(0, 60)}`;
+    if (h.action === "fill") return `typed "${(h.value || "").slice(0, 40)}"`;
+    if (h.action === "click") return `clicked on an element`;
+    if (h.action === "keypress") return `pressed ${h.value}`;
+    if (h.action === "scroll") return `scrolled`;
+    return null;
+  }).filter(Boolean);
+  if (actions.length > 0) return `Task complete. I ${actions.slice(-3).join(", then ")}.`;
+  return `Task complete: ${intentText.slice(0, 100)}`;
 }
 
 // ---- Helper: send message to background and await response ----

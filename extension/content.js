@@ -134,6 +134,18 @@ function getNodeText(el) {
 // ---- Message listener ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
+  // Ping — used by background to check if content script is loaded
+  if (message.type === "PING") {
+    sendResponse({ pong: true });
+    return;
+  }
+
+  // Ready check — used for smart settle after navigation
+  if (message.type === "READY_CHECK") {
+    sendResponse({ ready: document.readyState === "complete" });
+    return;
+  }
+
   // Permission banner
   if (message.type === "SHOW_PERMISSION") {
     showPermissionBanner(message.description, sendResponse);
@@ -254,6 +266,36 @@ function executeAction(msg, sendResponse) {
       case "focus":
         if (!el) { sendResponse({ success: false, error: `Element not found: ${selector}` }); return; }
         el.focus();
+        sendResponse({ success: true });
+        break;
+
+      case "keypress": {
+        const target = el || document.activeElement || document.body;
+        const keyMap = {
+          enter: "Enter", tab: "Tab", escape: "Escape", space: " ",
+          arrowdown: "ArrowDown", arrowup: "ArrowUp",
+          arrowleft: "ArrowLeft", arrowright: "ArrowRight",
+          backspace: "Backspace", delete: "Delete"
+        };
+        const key = keyMap[(value || "").toLowerCase()] || value;
+        target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new KeyboardEvent("keypress", { key, bubbles: true, cancelable: true }));
+        target.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true, cancelable: true }));
+        sendResponse({ success: true });
+        break;
+      }
+
+      case "select":
+        if (!el) { sendResponse({ success: false, error: `Element not found: ${selector}` }); return; }
+        el.value = value || "";
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        sendResponse({ success: true });
+        break;
+
+      case "hover":
+        if (!el) { sendResponse({ success: false, error: `Element not found: ${selector}` }); return; }
+        el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+        el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
         sendResponse({ success: true });
         break;
 
