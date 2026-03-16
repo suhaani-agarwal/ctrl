@@ -1,5 +1,5 @@
 ## ctrl – Your autonomous AI copilot for the browser
-ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.**
+ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.
 You pick your avatar. You give it a name if you want. And then it's just... there. Always listening, always ready, never in the way unless you need it.
 ---
 ### Why ctrl?
