@@ -1,7 +1,8 @@
-## ctrl – Your autonomous AI copilot for the browser
+### ctrl – Your autonomous AI copilot for the browser
 
-ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.
+Ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.
 You pick your avatar. You give it a name if you want. And then it's just... there. Always listening, always ready, never in the way unless you need it.
+
 ---
 ### Why ctrl?
 
@@ -339,27 +340,82 @@ You can experiment with similar workflows in **Docs, Notion, Trello, Jira, etc.*
 
 ---
 
-# Advanced usage & customization ideas
+## Real-world use cases
 
-You can extend ctrl in multiple directions.
+### 1. Hands-free form filling (accessibility & comfort)
 
----
+Imagine you’re injured, can’t type easily, or simply want to lean back and talk instead of pecking at fields.
 
-## New tools for planner / workers
+- You open a long signup or application form in your browser.
+- You launch ctrl and say:
 
-Add more specialized worker tools:
+  > “Help me fill this form. My name is Alex Chen, I live in San Francisco, I work as a product manager, and I’m applying for the remote role.”
 
-- Calendar / email integration
-- Code review or repo navigation (via web apps)
-- Data dashboard interaction (filters, exports)
+- Ctrl:
+  - Scans the visible form fields and DOM structure.
+  - Asks clarifying questions when needed:
 
----
+    > “Is your preferred email the one already autofilled, or should I use another?”  
+    > “For ‘experience level’, should I select Mid, Senior, or Lead?”
 
-## Custom prompts & personas
+  - Fills fields intelligently, section by section, reading back critical fields before submitting.
+  - Waits for your explicit confirmation before pressing **Submit**.
 
-- Define personalities and domain expertise for particular avatars.
-- Configure different planners for different tasks  
-  (e.g., **“research mode”** vs **“execution mode”**).
+This is especially powerful if you have limited mobility, are multitasking, or just prefer to dictate instead of typing.
+
+### 2. Voice-driven research and web flows
+
+- “Compare the pricing of these three SaaS tools and summarize the differences in a bullet list in Notion.”  
+- “Log in to my analytics dashboard, apply last-month filters, and tell me which channel had the highest growth.”  
+- “Open my email, draft a follow-up to the last message from Sarah summarizing today’s meeting.”
+
+Ctrl combines:
+
+- Live exploration of pages via DOM + screenshots.
+- Planner + workers to:
+  - Navigate between tabs and apps.
+  - Extract and summarize information.
+  - Populate other tools (docs, notes, email, tickets) on your behalf.
+
+### 3. Presentation building and iteration (Google Slides, etc.)
+
+Ctrl doesn’t just “help with slides” — it can drive the whole workflow end-to-end:
+
+- You say:
+
+  > “Create a 10-slide presentation on ‘AI safety for product teams’ with:  
+  > 1) a title slide, 2) agenda, 3–8) content slides with examples, 9) risks & mitigations, 10) next steps.”
+
+- Ctrl:
+  - Opens Google Slides in your browser.
+  - Creates a new deck, sets up the outline, and titles each slide.
+  - Drafts content for each slide using your tone and target audience.
+  - Asks you questions along the way:
+
+    > “Do you prefer a more technical or non-technical audience?”  
+    > “Should I include code snippets, diagrams, or keep it high-level?”
+
+  - Refines structure, wording, and visual emphasis as you give feedback:
+
+    > “Make slide 3 more concise and slide 5 more example-heavy.”  
+    > “Add a final call-to-action slide for stakeholders.”
+
+All of this happens **in your browser**, on your existing Slides tab, with ctrl clicking, typing, and navigating on your behalf.
+
+### 4. Everyday “copilot” tasks
+
+Some other patterns ctrl is designed for:
+
+- **Inbox triage**: skim emails, summarize threads, and draft replies.
+- **Task board wrangling**: move cards, update statuses, leave comments in tools like Trello/Jira/Linear.
+- **Knowledge digging**: open multiple sources, read and summarize, and then synthesize into a doc or note.
+- **Scheduling flows**: open your calendar, propose time slots, and draft scheduling emails or messages.
+
+In all of these, ctrl:
+
+- Maintains a live conversational loop with you.
+- Acts directly in your browser.
+- Delegates sub-tasks to specialized workers under the hood.
 
 ---
 
