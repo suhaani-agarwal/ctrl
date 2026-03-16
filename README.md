@@ -1,8 +1,10 @@
 ## ctrl – Your autonomous AI copilot for the browser
+
 ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.
 You pick your avatar. You give it a name if you want. And then it's just... there. Always listening, always ready, never in the way unless you need it.
 ---
 ### Why ctrl?
+
 Here’s what makes **ctrl** different from anything else:
 - **Live, interruptible conversation**  
   Powered by Gemini Live, your agent talks with you, not at you. Mid‑sentence? Change your mind? Just say so. It adapts instantly without losing context.
@@ -64,51 +66,63 @@ At a high level, ctrl is made of:
     - Content generation and formatting.
 - **Optional native host**
   - Chrome Native Messaging host for OS‑level tasks (window focus, app launching, etc).
-### Data‑flow / architecture diagram
+
+### Data-flow / architecture diagram
+
 ```mermaid
 flowchart LR
-  subgraph Browser[Chrome + ctrl Extension]
-    SP[Side Panel UI\n(voice + status + preview)]
-    BG[Background Service Worker\n(background.js)]
-    CS[Content Script(s)\n(content.js, overlays)]
-    OFF[Offscreen Doc\nmic capture]
-    PAGE[Active Tab\nWeb App / Site]
+
+  subgraph Browser["Chrome + ctrl Extension"]
+    SP["Side Panel UI (voice + status + preview)"]
+    BG["Background Service Worker (background.js)"]
+    CS["Content Script(s) (content.js, overlays)"]
+    OFF["Offscreen Doc (mic capture)"]
+    PAGE["Active Tab (Web App / Site)"]
   end
-  subgraph Gemini[Gemini Agent Runtime]
-    LIVE[Gemini Live\n(conversational loop)]
-    PLAN[Planner Agent]
-    W1[UI Worker\n(browser-action tool)]
-    W2[Content Worker\n(copy, text, slides)]
-    W3[Search / Tools\nweb + APIs]
+
+  subgraph Gemini["Gemini Agent Runtime"]
+    LIVE["Gemini Live (conversational loop)"]
+    PLAN["Planner Agent"]
+    W1["UI Worker (browser-action tool)"]
+    W2["Content Worker (copy, text, slides)"]
+    W3["Search / Tools (web + APIs)"]
   end
-  subgraph OS[Host OS]
-    NH[Native Host\n(optional)]
+
+  subgraph OS["Host OS"]
+    NH["Native Host (optional)"]
   end
+
   %% Browser internals
-  SP <---> BG
-  BG <---> CS
-  BG <---> OFF
-  CS <---> PAGE
+  SP <--> BG
+  BG <--> CS
+  BG <--> OFF
+  CS <--> PAGE
+
   %% Live conversation
-  OFF -- audio chunks --> BG
-  BG -- bidi websocket --> LIVE
-  LIVE -- text + audio --> BG
-  BG -- server messages --> SP
-  %% Planner & workers
-  LIVE <---> PLAN
-  PLAN <---> W1
-  PLAN <---> W2
-  PLAN <---> W3
+  OFF -->|audio chunks| BG
+  BG -->|bidi websocket| LIVE
+  LIVE -->|text + audio| BG
+  BG -->|server messages| SP
+
+  %% Planner and workers
+  LIVE <--> PLAN
+  PLAN <--> W1
+  PLAN <--> W2
+  PLAN <--> W3
+
   %% Browser action tool
-  W1 -- "click/fill/scroll/navigate" --> BG
-  BG -- EXECUTE / PREVIEW --> CS
-  CS -- actions --> PAGE
-  CS -- DOM snapshot + state --> BG
-  BG -- page context --> LIVE
+  W1 -->|"click/fill/scroll/navigate"| BG
+  BG -->|EXECUTE / PREVIEW| CS
+  CS -->|actions| PAGE
+  CS -->|DOM snapshot + state| BG
+  BG -->|page context| LIVE
+
   %% Native host
   PLAN --> NH
   NH --> BG
-# ctrl
+```
+
+--- 
 
 ## Conceptually
 
