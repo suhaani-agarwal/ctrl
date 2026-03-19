@@ -6,7 +6,7 @@ import { initSkillRegistry, getAllSkills, getSkill, getSkillManifest } from "./s
 const MAX_ROUNDS = 15;
 const SETTLE_MS = 150;
 const NAVIGATE_SETTLE_MS = 1200;
-const SENSITIVE_ACTIONS = new Set(["navigate", "type"]);
+const SENSITIVE_ACTIONS = new Set(["type"]);
 const GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions";
 
 // ---- State ----
@@ -349,7 +349,7 @@ async function buildAnnotatedScreenshot(tabId) {
   // 4. Annotate with OffscreenCanvas
   let annotatedB64 = screenshotB64; // fallback: unannotated
   try {
-    const bytes = Uint8Array.from(atob(screenshotB64), c => c.charCodeAt(0));
+    // const bytes = Uint8Array.from(atob(screenshotB64), c => c.charCodeAt(0));
     const blob = new Blob([bytes], { type: "image/jpeg" });
     const img = await createImageBitmap(blob);
 
@@ -376,7 +376,10 @@ async function buildAnnotatedScreenshot(tabId) {
 
     const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.8 });
     const arrBuf = await outBlob.arrayBuffer();
-    annotatedB64 = btoa(String.fromCharCode(...new Uint8Array(arrBuf)));
+    const bytes = new Uint8Array(arrBuf);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    annotatedB64 = btoa(binary);
   } catch (e) {
     console.warn("BG: annotation failed, using raw screenshot", e);
   }
@@ -591,16 +594,19 @@ Available skills:
 ${skillList}
 
 Rules:
-- Use "simple" for 1-3 action tasks (click a button, scroll, navigate somewhere)
-- Use "multi-step" for complex tasks on a single site requiring 4+ actions
-- Use "multi-tab-parallel" ONLY when explicitly comparing/researching across 2+ different websites
+- Use "simple" for tasks requiring fewer than 4 actions (navigate somewhere, click a button, scroll, play a video)
+- Use "multi-step" for complex tasks requiring 4+ distinct actions (fill a form, complete a checkout, etc.)
+- Use "multi-tab-parallel" ONLY when explicitly comparing across 2+ different websites simultaneously
 - Use "workflow-replay" only when user says "do [workflow name]" or references a saved workflow
 - Match skill semantically, not just by keywords
+- For "simple" tasks that require going to a different website, the agent will handle navigation itself — do NOT add a navigate step in steps[]
 - Return ONLY valid JSON, no commentary`;
 
   const userMsg = `Intent: "${intentText}"
 Current URL: ${currentTab?.url || "unknown"}
-Page title: ${currentTab?.title || "unknown"}`;
+Page title: ${currentTab?.title || "unknown"}
+
+Important: if the task requires a website the user is NOT currently on, the vision agent will navigate there automatically. You just need to describe WHAT to do, not HOW to navigate.`;
 
   try {
     const raw = await callGroq("openai/gpt-oss-20b", [
@@ -619,41 +625,47 @@ Page title: ${currentTab?.title || "unknown"}`;
 }
 
 // ---- Vision Action Agent Loop ----
-const VISION_SYSTEM_PROMPT = `You are a precise browser automation agent. You control a real browser via CDP.
+const VISION_SYSTEM_PROMPT = `You are a precise browser automation agent controlling a real browser via CDP.
 
-INPUTS you receive each round:
-1. An annotated screenshot with NUMBERED colored boxes over interactive elements
-2. A numbered element list matching the boxes
-3. The current task/goal
-4. Previously failed element indices (do not retry these)
-5. Data extracted so far
+Each round you receive:
+1. An annotated screenshot — colored numbered boxes mark every interactive element
+2. A numbered element list matching those boxes
+3. CURRENT URL and page title
+4. The task/goal, round number, previously failed elements, extracted data so far
 
-OUTPUT: Valid JSON object with exactly these fields:
+OUTPUT — always return exactly this JSON shape:
 {
-  "thought": "Brief reasoning about what you see and what to do next",
+  "thought": "1-2 sentence reasoning: where am I, what do I see, what's my next move",
   "actions": [...],
   "done": false,
   "extractedData": {}
 }
 
 ACTION TYPES:
+- {"type": "navigate", "url": "https://..."}           ← go to a URL directly
 - {"type": "click", "elementIndex": N}
 - {"type": "type", "elementIndex": N, "value": "text", "clear": true}
 - {"type": "scroll", "direction": "down"|"up", "amount": 400}
-- {"type": "navigate", "url": "https://..."}
 - {"type": "keypress", "key": "Enter"|"Tab"|"Escape"|"ArrowDown", "elementIndex": N}
 - {"type": "select", "elementIndex": N, "value": "option text"}
-- {"type": "extract", "fields": {"price": "the displayed price", "title": "product name"}}
+- {"type": "extract", "fields": {"fieldName": "description of value to capture"}}
 - {"type": "wait", "ms": 500}
 
-RULES:
-1. Reference elements by NUMBER ONLY. Never guess coordinates.
-2. Failed elements: do not attempt them again. Find alternatives.
-3. Set done=true ONLY when the task is fully complete or truly impossible.
-4. Use extract before navigating away from pages with data you need.
-5. For SPAs: after clicking, use wait 800ms before next screenshot if content is loading.
-6. Keep thought brief — 1-2 sentences max.
-7. Return only the JSON object, nothing else.`;
+NAVIGATION RULES — READ CAREFULLY:
+- If the task requires a website different from CURRENT URL, your FIRST action MUST be navigate to that site's URL. Do NOT use any search box on the current page to get there.
+- Examples:
+    task="open YouTube", current url="chatgpt.com" → {"type":"navigate","url":"https://youtube.com"}
+    task="go to gmail", current url="google.com"   → {"type":"navigate","url":"https://mail.google.com"}
+    task="search cat videos on youtube", current url="chatgpt.com" → FIRST navigate to https://youtube.com, THEN search
+- Always construct the correct full URL yourself. Never rely on the current page's search.
+
+EXECUTION RULES:
+1. Reference elements by NUMBER ONLY — never guess coordinates.
+2. Do not retry failed elements — find an alternative approach.
+3. Set done=true only when the task is fully complete or truly impossible.
+4. Extract data before navigating away from a page that has it.
+5. For SPAs/dynamic pages: after clicking something that loads content, add {"type":"wait","ms":800} before the next action.
+6. Return only the JSON object — no markdown, no commentary.`;
 
 async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null) {
   console.log("BG: VisionActionAgent start — tab:", tabId, "goal:", goal, "skill:", skillName);
@@ -688,6 +700,14 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       continue;
     }
 
+    // Get current tab URL and title for context
+    let currentUrl = "unknown", currentTitle = "unknown";
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      currentUrl = tab.url || "unknown";
+      currentTitle = tab.title || "unknown";
+    } catch {}
+
     // Build prompt
     const userContent = [
       {
@@ -697,6 +717,8 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       {
         type: "text",
         text: [
+          `CURRENT URL: ${currentUrl}`,
+          `PAGE TITLE: ${currentTitle}`,
           `TASK: ${goal}`,
           `Round: ${round}/${MAX_ROUNDS}`,
           failedElements.length ? `Failed elements (do NOT retry): [${failedElements.join(", ")}]` : "",
