@@ -1,43 +1,44 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>AI Agent</title>
+  <title>ctrl</title>
   <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
-  <div class="container">
+  <div id="panel">
+
+    <!-- Header -->
     <header>
-      <h1>AI Agent</h1>
-      <button id="settings-toggle" title="Settings">⚙️</button>
+      <span class="agent-name">ctrl</span>
+      <span id="status-badge" class="badge idle">Idle</span>
+      <button id="abort-btn" class="abort-btn hidden" title="Abort current task">&#9632; Stop</button>
     </header>
 
-    <div id="settings-panel" class="hidden">
-      <label for="api-key">Gemini API Key</label>
-      <input type="password" id="api-key" placeholder="Paste your API key...">
-      <p class="hint">Stored locally. Get yours at aistudio.google.com</p>
-    </div>
-
-    <div id="page-preview" class="hidden">
-      <img id="screenshot-thumb" alt="Page preview" title="Click to expand">
-    </div>
-
-    <div id="action-badges"></div>
-
-    <main id="transcript"></main>
-
-    <div id="details-section">
-      <button id="details-toggle" class="details-btn">Details ▸</button>
-      <div id="details-body" class="hidden"></div>
-    </div>
-
-    <div class="controls">
-      <div id="status-bar">
-        <span id="status-text">Initializing...</span>
-        <div id="screenshot-indicator" title="Capturing screen"></div>
+    <!-- Task card (shown when task is running) -->
+    <div id="task-card" class="hidden">
+      <div id="task-text"></div>
+      <div id="task-meta">
+        <span id="skill-badge" class="skill-tag hidden"></span>
+        <span id="step-counter" class="step-tag hidden"></span>
       </div>
-      <button id="mic-btn" title="Hold to talk">
-        <svg viewBox="0 0 24 24" width="28" height="28" fill="none"
+      <div id="tab-badges"></div>
+    </div>
+
+    <!-- Voice transcript (conversation bubbles) -->
+    <div id="transcript"></div>
+
+    <!-- Live action log -->
+    <div id="action-log-wrap">
+      <div id="action-log-header">Action Log</div>
+      <div id="action-log"></div>
+    </div>
+
+    <!-- Footer controls -->
+    <footer>
+      <button id="record-btn" class="icon-btn" title="Record workflow">&#9210;</button>
+      <button id="mic-btn" class="mic-btn mic-off" title="Click to start/stop listening">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none"
              stroke="currentColor" stroke-width="2"
              stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
@@ -46,7 +47,53 @@
           <line x1="8" y1="23" x2="16" y2="23"/>
         </svg>
       </button>
+      <button id="settings-btn" class="icon-btn" title="Settings">&#9881;</button>
+    </footer>
+
+    <!-- Recording banner -->
+    <div id="recording-banner" class="hidden">
+      <span class="rec-dot"></span> Recording workflow&hellip; say &ldquo;stop recording&rdquo; to save.
     </div>
+
+    <!-- Settings drawer -->
+    <div id="settings-drawer" class="hidden">
+      <div class="settings-header">
+        <span class="settings-title">Settings</span>
+        <button id="settings-close-btn" title="Back">&#8592; Back</button>
+      </div>
+      <div class="settings-section">
+        <label>Gemini API Key</label>
+        <input type="password" id="gemini-key" placeholder="Paste Gemini key...">
+        <span class="hint">Get yours at aistudio.google.com</span>
+      </div>
+      <div class="settings-section">
+        <label>Groq API Key</label>
+        <input type="password" id="groq-key" placeholder="Paste Groq key...">
+        <span class="hint">Get yours at console.groq.com</span>
+      </div>
+      <div class="settings-section">
+        <label>Permission Mode</label>
+        <select id="permission-mode">
+          <option value="ask">Ask Always</option>
+          <option value="domain">Ask Per Domain</option>
+          <option value="silent">Silent</option>
+        </select>
+      </div>
+      <div class="settings-section">
+        <label>Installed Skills</label>
+        <div id="skills-list"></div>
+        <div class="skill-install-row">
+          <input type="text" id="skill-url" placeholder="GitHub raw URL to install skill...">
+          <button id="install-skill-btn">Install</button>
+        </div>
+        <span id="install-status" class="hint"></span>
+      </div>
+      <div class="settings-section">
+        <label>Saved Workflows</label>
+        <div id="workflows-list"></div>
+      </div>
+    </div>
+
   </div>
   <script src="sidepanel.js"></script>
 </body>

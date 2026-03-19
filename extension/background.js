@@ -1,128 +1,234 @@
-// background.js
-let socket = null;
-let apiKey = null;
+// background.js — Service worker. Central hub for all agent logic.
+// Imports skills registry (module type declared in manifest).
+import { initSkillRegistry, getAllSkills, getSkill, getSkillManifest } from "./skills/index.js";
+
+// ---- Constants ----
+const MAX_ROUNDS = 15;
+const SETTLE_MS = 150;
+const NAVIGATE_SETTLE_MS = 1200;
+const SENSITIVE_ACTIONS = new Set(["navigate", "type"]);
+const GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions";
+
+// ---- State ----
+let geminiSocket = null;
+let geminiApiKey = null;
+let groqApiKey = null;
 let intentionalClose = false;
 let reconnectCount = 0;
 const MAX_RECONNECTS = 3;
 let nativePort = null;
+let abortController = null; // abort current task loop
 
-// ---- Side panel ----
-chrome.action.onClicked.addListener((tab) => {
-  chrome.sidePanel.open({ windowId: tab.windowId });
-});
+// CDP: tabId → { attached: boolean }
+const cdpSessions = new Map();
+// Per-round element map: tabId → Map<index, { backendNodeId, x, y, w, h, role, name }>
+const elementMaps = new Map();
+
+// Task contexts: taskId → TaskContext
+const taskContexts = new Map();
+
+// ---- Init ----
+chrome.action.onClicked.addListener((tab) => chrome.sidePanel.open({ windowId: tab.windowId }));
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
-// ---- Native host ----
-function getNativePort() {
-  if (nativePort) return nativePort;
-  try {
-    nativePort = chrome.runtime.connectNative("com.ctrl.ai_agent_host");
-    nativePort.onDisconnect.addListener(() => { nativePort = null; });
-  } catch (e) {
-    nativePort = null;
-  }
-  return nativePort;
+// Load skills and restore API keys on startup (service workers restart frequently)
+async function onStartup() {
+  await initSkillRegistry().catch(console.error);
+  const { groq_key, gemini_key } = await chrome.storage.local.get(["groq_key", "gemini_key"]);
+  if (groq_key) { groqApiKey = groq_key; console.log("BG: Groq key restored from storage"); }
+  if (gemini_key) { geminiApiKey = gemini_key; console.log("BG: Gemini key restored from storage"); }
+}
+onStartup();
+
+// ---- Event broadcast ----
+// Sends { type: "AGENT_EVENT", event: { type, ...fields } } to the side panel.
+function broadcastEvent(event) {
+  chrome.runtime.sendMessage({ type: "AGENT_EVENT", event }).catch(() => {});
+}
+function broadcastRaw(msg) {
+  chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
-// ---- WebSocket ----
-function connectWebSocket(key) {
-  if (!key) return;
-  apiKey = key;
-  if (socket) { socket.onclose = null; socket.close(); }
+// ---- Gemini Live WebSocket ----
+function connectGeminiLive(gKey) {
+  if (!gKey) return;
+  geminiApiKey = gKey;
+  if (geminiSocket) { geminiSocket.onclose = null; geminiSocket.close(); }
 
-  console.log("BG: connecting WebSocket...");
-  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
-  socket = new WebSocket(url);
+  const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${geminiApiKey}`;
+  geminiSocket = new WebSocket(url);
 
-  socket.onopen = () => {
-    console.log("BG: WebSocket open");
+  geminiSocket.onopen = () => {
+    console.log("BG: Gemini Live open");
     reconnectCount = 0;
-    socket.send(JSON.stringify({
+    geminiSocket.send(JSON.stringify({
       setup: {
         model: "models/gemini-2.5-flash-native-audio-latest",
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: "Aoede" }
-            }
-          }
+        generation_config: {
+          response_modalities: ["AUDIO"],
+          speech_config: { voice_config: { prebuilt_voice_config: { voice_name: "Aoede" } } }
         },
-        systemInstruction: {
+        // inputAudioTranscription: get user's speech as text so we can route it to Groq
+        input_audio_transcription: {},
+        system_instruction: {
           parts: [{
             text:
-              "You are a friendly voice assistant for a browser automation tool. " +
-              "The user speaks tasks; a separate system executes them in the browser.\n\n" +
-              "WHEN the user speaks a task:\n" +
-              "- Acknowledge in one short, natural sentence. Be warm, not robotic.\n" +
-              "- Do NOT describe what steps you will take.\n" +
-              "- Do NOT output commands, structured data, or ACTION lines.\n\n" +
-              "WHEN you receive a message starting with [TASK_DONE]:\n" +
-              "- Summarize what was accomplished in 1-2 natural, friendly sentences.\n" +
-              "- Example: 'Done! I searched for cats and opened the top result.'\n" +
-              "- Do NOT repeat the raw data or say 'TASK_DONE'.\n\n" +
-              "If the user says 'stop' or 'cancel', acknowledge briefly.\n" +
-              "If the user gives a new instruction mid-task, acknowledge the change."
+              "You are ctrl, a voice interface for browser automation.\n\n" +
+              "RULE 1 — Browser tasks (navigate, click, search, fill, book, buy, compare, scroll, play, open, etc.):\n" +
+              "  a) Say a VERY short acknowledgement: 'Sure!', 'On it!', 'Got it.', 'Searching!' (3-5 words max)\n" +
+              "  b) On the next line output EXACTLY: [INTENT: plain description of what to do]\n" +
+              "  Example: user says 'fill out this form' → speak 'On it!' then output [INTENT: fill out the form on the current page]\n" +
+              "  Example: user says 'go to youtube' → speak 'Sure!' then output [INTENT: navigate to https://youtube.com]\n" +
+              "  Example: user says 'compare prices on amazon and flipkart' → speak 'Got it!' then output [INTENT: compare prices on Amazon and Flipkart]\n\n" +
+              "RULE 2 — Pure conversation (greetings, jokes, questions about you, weather, trivia):\n" +
+              "  Just respond naturally. Do NOT output [INTENT: ...] for these.\n\n" +
+              "RULE 3 — When you receive [TASK_DONE: result]:\n" +
+              "  Speak the result in 1 natural sentence. No JSON, no lists.\n\n" +
+              "RULE 4 — When you receive [TASK_FAILED: reason]:\n" +
+              "  Apologize in 1 sentence and mention the reason.\n\n" +
+              "RULE 5 — Never output markdown, bullet points, bold text, or structured data in spoken responses.\n" +
+              "RULE 6 — Keep ALL spoken responses to 1-2 sentences maximum."
           }]
         }
       }
     }));
-    broadcastToPanel({ type: "WEBSOCKET_CONNECTED" });
+    broadcastRaw({ type: "WEBSOCKET_CONNECTED" });
   };
 
-  socket.onmessage = async (event) => {
+  geminiSocket.onmessage = async (event) => {
     try {
       const text = event.data instanceof Blob ? await event.data.text() : event.data;
-      broadcastToPanel({ type: "SERVER_MESSAGE", data: text });
-    } catch (e) { console.error("BG: parse error", e); }
+      // Forward raw message to panel (for audio playback)
+      broadcastRaw({ type: "SERVER_MESSAGE", data: text });
+      // Parse for [INTENT:], [RECORD_START], [RECORD_STOP]
+      handleGeminiLiveMessage(text);
+    } catch (e) { console.error("BG: Gemini parse error", e); }
   };
 
-  socket.onclose = (event) => {
-    console.log("BG: WebSocket closed", event.code, event.reason);
+  geminiSocket.onclose = (event) => {
+    console.log("BG: Gemini closed", event.code);
     if (event.code === 1008) {
-      broadcastToPanel({ type: "STATUS", status: "error", message: event.reason });
+      broadcastRaw({ type: "STATUS", status: "error", message: event.reason });
       return;
     }
     if (!intentionalClose && reconnectCount < MAX_RECONNECTS) {
       reconnectCount++;
-      broadcastToPanel({ type: "STATUS", status: "reconnecting" });
-      setTimeout(() => connectWebSocket(apiKey), 2000);
+      broadcastRaw({ type: "STATUS", status: "reconnecting" });
+      setTimeout(() => connectGeminiLive(geminiApiKey), 2000);
     } else {
-      broadcastToPanel({ type: "STATUS", status: "disconnected" });
+      broadcastRaw({ type: "STATUS", status: "disconnected" });
     }
   };
 
-  socket.onerror = (e) => console.error("BG: WebSocket error", e);
+  geminiSocket.onerror = (e) => console.error("BG: Gemini error", e);
 }
 
-function broadcastToPanel(msg) {
-  chrome.runtime.sendMessage(msg).catch(() => {});
-}
-
-// Inject content.js into a tab if it hasn't loaded yet (e.g. after extension reload)
-function ensureContentScript(tabId) {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { type: "PING" }, (resp) => {
-      if (chrome.runtime.lastError || !resp) {
-        chrome.scripting.executeScript(
-          { target: { tabId }, files: ["content.js"] },
-          () => {
-            if (chrome.runtime.lastError) {
-              console.warn("BG: could not inject content script:", chrome.runtime.lastError.message);
-              resolve(false);
-            } else {
-              resolve(true);
-            }
-          }
-        );
-      } else {
-        resolve(true);
+function sendToGeminiLive(textContent) {
+  if (geminiSocket?.readyState === WebSocket.OPEN) {
+    geminiSocket.send(JSON.stringify({
+      clientContent: {
+        turns: [{ role: "user", parts: [{ text: textContent }] }],
+        turnComplete: true
       }
-    });
-  });
+    }));
+  }
 }
 
-// ---- Offscreen document for mic ----
+// Accumulate text across partial model turn messages before parsing for [INTENT:]
+let geminiTextBuffer = "";
+// Accumulate user speech transcription chunks
+let geminiInputTranscriptBuffer = "";
+
+function handleGeminiLiveMessage(rawText) {
+  let parsed;
+  try { parsed = JSON.parse(rawText); } catch { return; }
+
+  // inputTranscription — accumulate partial chunks
+  const inputTranscription = parsed?.serverContent?.inputTranscription;
+  if (inputTranscription?.text?.trim()) {
+    geminiInputTranscriptBuffer += inputTranscription.text;
+    console.log("BG: inputTranscription:", inputTranscription.text.slice(0, 80));
+  }
+
+  // Accumulate text parts from modelTurn
+  const parts = parsed?.serverContent?.modelTurn?.parts || [];
+  for (const part of parts) {
+    if (part.text) {
+      geminiTextBuffer += part.text;
+    }
+  }
+
+  // On turnComplete — parse the accumulated text for [INTENT: ...]
+  if (parsed?.serverContent?.turnComplete) {
+    const fullText = geminiTextBuffer.trim();
+    const userTranscript = geminiInputTranscriptBuffer.trim();
+    geminiTextBuffer = "";
+    geminiInputTranscriptBuffer = "";
+
+    if (fullText) {
+      console.log("BG: Gemini full turn:", fullText.slice(0, 200));
+    }
+
+    // Primary path: model outputs [INTENT: ...]
+    const intentMatch = fullText.match(/\[INTENT:\s*([\s\S]+?)(?:\]|$)/);
+    if (intentMatch) {
+      const intentText = intentMatch[1].trim().replace(/\]$/, "");
+      console.log("BG: [INTENT] detected:", intentText);
+      broadcastRaw({ type: "INTENT_DETECTED", intentText });
+      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+        dispatchTask(intentText, tab).catch(e => console.error("BG: dispatchTask error:", e));
+      });
+    } else if (userTranscript) {
+      // Fallback: model didn't output [INTENT:], use the user's transcribed speech directly
+      console.log("BG: No [INTENT] marker, routing transcript:", userTranscript.slice(0, 80));
+      checkAndDispatchIntent(userTranscript);
+    }
+
+    if (fullText.includes("[RECORD_START]")) broadcastRaw({ type: "RECORD_START" });
+    if (fullText.includes("[RECORD_STOP]"))  broadcastRaw({ type: "RECORD_STOP" });
+  }
+}
+
+// Decide if the user's speech is a browser task and dispatch directly.
+// Uses fast keyword check first, then llama-4-scout for ambiguous cases.
+const TASK_KEYWORDS = /\b(go to|navigate|open|search|click|type|fill|book|buy|find|scroll|close|play|pause|send|email|compose|compare|look up|check|download|sign in|log in|logout|submit|add to cart|checkout)\b/i;
+
+async function checkAndDispatchIntent(userText) {
+  // Always broadcast so sidepanel can show the user transcript
+  broadcastRaw({ type: "INTENT_DETECTED", intentText: userText });
+
+  // Fast keyword check — obvious browser tasks skip the LLM call
+  if (TASK_KEYWORDS.test(userText)) {
+    console.log("BG: Task detected (keyword match), dispatching:", userText);
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      dispatchTask(userText, tab).catch(e => console.error("BG: dispatchTask error:", e));
+    });
+    return;
+  }
+
+  // Ambiguous — ask llama-4-scout (very fast, ~200ms)
+  if (!groqApiKey) {
+    console.warn("BG: No Groq key, can't classify intent");
+    return;
+  }
+  try {
+    const raw = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [{
+      role: "user",
+      content: `Is this a browser automation request (navigate, click, search, fill form, etc.)? Reply ONLY with JSON {"actionable": true} or {"actionable": false}.\n\nText: "${userText}"`
+    }], { jsonMode: true });
+    const { actionable } = JSON.parse(raw);
+    console.log("BG: Intent check:", userText, "→ actionable:", actionable);
+    if (actionable) {
+      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+        dispatchTask(userText, tab).catch(e => console.error("BG: dispatchTask error:", e));
+      });
+    }
+  } catch (e) {
+    console.warn("BG: Intent check failed:", e.message);
+  }
+}
+
+// ---- Offscreen document (mic) ----
 async function ensureOffscreen() {
   const existing = await chrome.offscreen.hasDocument();
   if (!existing) {
@@ -136,23 +242,852 @@ async function ensureOffscreen() {
 
 async function closeOffscreen() {
   try {
-    const has = await chrome.offscreen.hasDocument();
-    if (has) await chrome.offscreen.closeDocument();
-  } catch (e) {}
+    if (await chrome.offscreen.hasDocument()) await chrome.offscreen.closeDocument();
+  } catch {}
 }
 
-// ---- Message handler ----
+// ---- CDP Manager ----
+chrome.debugger.onDetach.addListener((source) => {
+  cdpSessions.set(source.tabId, { attached: false });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (cdpSessions.get(tabId)?.attached) {
+    chrome.debugger.detach({ tabId }).catch(() => {});
+  }
+  cdpSessions.delete(tabId);
+  elementMaps.delete(tabId);
+});
+
+async function ensureAttached(tabId) {
+  const session = cdpSessions.get(tabId);
+  if (session?.attached) return;
+  console.log("BG: Attaching CDP to tab", tabId);
+  await chrome.debugger.attach({ tabId }, "1.3");
+  cdpSessions.set(tabId, { attached: true });
+  // Enable domains required for our pipeline
+  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "Network.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}).catch(() => {});
+  console.log("BG: CDP attached and domains enabled for tab", tabId);
+}
+
+async function cdp(tabId, method, params = {}) {
+  await ensureAttached(tabId);
+  return chrome.debugger.sendCommand({ tabId }, method, params);
+}
+
+// ---- Annotated Screenshot Pipeline ----
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "textbox", "searchbox", "combobox", "listbox",
+  "menuitem", "checkbox", "radio", "slider", "spinbutton", "tab",
+  "option", "treeitem", "columnheader", "menuitemcheckbox", "menuitemradio",
+  "switch", "gridcell"
+]);
+
+const ROLE_COLORS = {
+  button: [59, 130, 246],     // blue
+  link: [234, 179, 8],         // yellow
+  textbox: [34, 197, 94],      // green
+  searchbox: [34, 197, 94],    // green
+  combobox: [34, 197, 94],     // green
+  checkbox: [249, 115, 22],    // orange
+  radio: [249, 115, 22],       // orange
+  default: [168, 85, 247]      // purple
+};
+
+async function buildAnnotatedScreenshot(tabId) {
+  // 1. Raw screenshot
+  const { data: screenshotB64 } = await cdp(tabId, "Page.captureScreenshot", {
+    format: "jpeg", quality: 75
+  });
+
+  // 2. Accessibility tree
+  let interactiveNodes = [];
+  try {
+    const { nodes } = await cdp(tabId, "Accessibility.getFullAXTree");
+    interactiveNodes = nodes.filter(n =>
+      n.role?.value && INTERACTIVE_ROLES.has(n.role.value) && !n.ignored && n.backendDOMNodeId
+    );
+  } catch (e) {
+    console.warn("BG: AXTree failed", e);
+  }
+
+  // 3. Bounding boxes — fetch in parallel (much faster than sequential)
+  const capped = interactiveNodes.slice(0, 60);
+  const boxResults = await Promise.all(capped.map(async (node) => {
+    try {
+      const { model } = await cdp(tabId, "DOM.getBoxModel", { backendNodeId: node.backendDOMNodeId });
+      return { node, model };
+    } catch { return null; }
+  }));
+
+  const elements = [];
+  for (const res of boxResults) {
+    if (!res) continue;
+    const { node, model } = res;
+    const border = model.border; // [x1,y1, x2,y2, x3,y3, x4,y4]
+    const xs = [border[0], border[2], border[4], border[6]];
+    const ys = [border[1], border[3], border[5], border[7]];
+    const x = Math.min(...xs);
+    const y = Math.min(...ys);
+    const w = Math.max(...xs) - x;
+    const h = Math.max(...ys) - y;
+    if (w > 2 && h > 2) {
+      const name = node.name?.value || node.description?.value || "";
+      elements.push({
+        index: elements.length + 1,
+        backendNodeId: node.backendDOMNodeId,
+        role: node.role.value,
+        name: name.slice(0, 80),
+        x: Math.round(x), y: Math.round(y),
+        w: Math.round(w), h: Math.round(h)
+      });
+    }
+  }
+
+  // 4. Annotate with OffscreenCanvas
+  let annotatedB64 = screenshotB64; // fallback: unannotated
+  try {
+    const bytes = Uint8Array.from(atob(screenshotB64), c => c.charCodeAt(0));
+    const blob = new Blob([bytes], { type: "image/jpeg" });
+    const img = await createImageBitmap(blob);
+
+    const canvas = new OffscreenCanvas(img.width, img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    for (const el of elements) {
+      const [r, g, b] = ROLE_COLORS[el.role] || ROLE_COLORS.default;
+      ctx.fillStyle = `rgba(${r},${g},${b},0.35)`;
+      ctx.fillRect(el.x, el.y, el.w, el.h);
+      ctx.strokeStyle = `rgba(${r},${g},${b},0.9)`;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(el.x, el.y, el.w, el.h);
+
+      // Number label background
+      const labelW = el.index >= 10 ? 26 : 20;
+      ctx.fillStyle = `rgba(${r},${g},${b},0.95)`;
+      ctx.fillRect(el.x, el.y, labelW, 18);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 11px monospace";
+      ctx.fillText(String(el.index), el.x + 3, el.y + 13);
+    }
+
+    const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.8 });
+    const arrBuf = await outBlob.arrayBuffer();
+    annotatedB64 = btoa(String.fromCharCode(...new Uint8Array(arrBuf)));
+  } catch (e) {
+    console.warn("BG: annotation failed, using raw screenshot", e);
+  }
+
+  // 5. Build numbered element list text
+  const elementList = elements.map(el => {
+    const roleLabel = el.role.charAt(0).toUpperCase() + el.role.slice(1);
+    return `${el.index}. ${roleLabel} "${el.name || "(no label)"}"`;
+  }).join("\n") || "(no interactive elements detected)";
+
+  // 6. Store element map for this tab
+  const elementMap = new Map(elements.map(el => [el.index, el]));
+  elementMaps.set(tabId, elementMap);
+
+  return { annotatedB64, elementList, elementMap };
+}
+
+// ---- CDP Action Execution ----
+async function executeCdpAction(tabId, action, elementMap) {
+  const el = action.elementIndex ? elementMap.get(action.elementIndex) : null;
+
+  switch (action.type) {
+    case "click": {
+      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
+      const cx = el.x + el.w / 2;
+      const cy = el.y + el.h / 2;
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+      await sleep(80);
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", x: cx, y: cy, clickCount: 1 });
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", x: cx, y: cy, clickCount: 1 });
+      break;
+    }
+
+    case "type": {
+      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
+      // Focus element
+      await cdp(tabId, "DOM.focus", { backendNodeId: el.backendNodeId });
+      if (action.clear) {
+        // Select all + delete
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 8 });
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 8 });
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace" });
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
+      }
+      // Try insertText first (fast path for plain inputs)
+      try {
+        await cdp(tabId, "Input.insertText", { text: action.value });
+      } catch {
+        // Fallback: character-by-character (React/Vue controlled inputs)
+        for (const char of action.value) {
+          await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: char, text: char });
+          await cdp(tabId, "Input.dispatchKeyEvent", { type: "char", key: char, text: char });
+          await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: char, text: char });
+        }
+      }
+      break;
+    }
+
+    case "scroll": {
+      const amount = action.amount || 400;
+      const deltaY = action.direction === "up" ? -amount : amount;
+      // Scroll at center of viewport
+      const { result } = await cdp(tabId, "Runtime.evaluate", {
+        expression: `[window.innerWidth / 2, window.innerHeight / 2]`,
+        returnByValue: true
+      });
+      const [cx, cy] = result.value;
+      await cdp(tabId, "Input.dispatchMouseEvent", {
+        type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY
+      });
+      break;
+    }
+
+    case "navigate": {
+      await cdp(tabId, "Page.navigate", { url: action.url });
+      break;
+    }
+
+    case "keypress": {
+      const target = el;
+      if (target) {
+        await cdp(tabId, "DOM.focus", { backendNodeId: target.backendNodeId });
+      }
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: action.key, code: action.key });
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: action.key, code: action.key });
+      break;
+    }
+
+    case "select": {
+      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
+      // Use Runtime to set native select value
+      const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: el.backendNodeId });
+      if (object?.objectId) {
+        await cdp(tabId, "Runtime.callFunctionOn", {
+          functionDeclaration: `function(v) { this.value = v; this.dispatchEvent(new Event('change', {bubbles:true})); this.dispatchEvent(new Event('input', {bubbles:true})); }`,
+          objectId: object.objectId,
+          arguments: [{ value: action.value }]
+        });
+      }
+      break;
+    }
+
+    case "wait": {
+      await sleep(action.ms || 500);
+      break;
+    }
+
+    case "extract": {
+      // No-op: model reads data from AXTree via its own vision; extractedData returned in response
+      break;
+    }
+
+    default:
+      console.warn("BG: unknown action type", action.type);
+  }
+}
+
+// ---- Page settle detection ----
+async function waitForPageSettle(tabId, timeout = 8000) {
+  try {
+    await cdp(tabId, "Network.enable");
+  } catch {}
+
+  return new Promise((resolve) => {
+    let lastActivity = Date.now();
+    let settled = false;
+
+    const onEvent = (source, method) => {
+      if (source.tabId === tabId && method.startsWith("Network.loading")) {
+        lastActivity = Date.now();
+      }
+    };
+    chrome.debugger.onEvent.addListener(onEvent);
+
+    const check = setInterval(() => {
+      if (Date.now() - lastActivity > 600) {
+        clearInterval(check);
+        chrome.debugger.onEvent.removeListener(onEvent);
+        if (!settled) { settled = true; resolve({ settled: true }); }
+      }
+    }, 100);
+
+    setTimeout(() => {
+      clearInterval(check);
+      chrome.debugger.onEvent.removeListener(onEvent);
+      if (!settled) { settled = true; resolve({ settled: false, timedOut: true }); }
+    }, timeout);
+  });
+}
+
+// ---- Groq API caller ----
+async function callGroq(model, messages, { jsonMode = false } = {}) {
+  if (!groqApiKey) throw new Error("Groq API key not set");
+
+  const body = {
+    model,
+    messages,
+    temperature: 0.1,
+    max_tokens: 4096,
+  };
+  if (jsonMode) body.response_format = { type: "json_object" };
+
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(GROQ_BASE, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${groqApiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (res.status === 429) {
+        await sleep(1000 * Math.pow(2, attempt));
+        continue;
+      }
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Groq ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+      return data.choices[0].message.content;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await sleep(1000);
+    }
+  }
+  throw lastErr;
+}
+
+// ---- Orchestrator ----
+async function runOrchestrator(intentText, currentTab) {
+  console.log("BG: Orchestrator start:", intentText);
+  broadcastEvent({ type: "ORCHESTRATOR_START", intentText });
+
+  const skillManifest = getSkillManifest();
+  const skillList = skillManifest.map(s => `- ${s.name}: ${s.description}`).join("\n");
+
+  const systemPrompt = `You are an intent router for a browser automation agent.
+Given the user's intent and current page context, return a JSON object with:
+- taskType: "simple" | "multi-step" | "multi-tab-parallel" | "workflow-replay"
+- skill: the skill name that best matches (or null if none applies)
+- steps: array of step descriptions for multi-step tasks (1-5 steps)
+- parallelSubtasks: array of {subGoal, startUrl} for multi-tab-parallel tasks
+- workflowName: the workflow name if taskType is workflow-replay
+
+Available skills:
+${skillList}
+
+Rules:
+- Use "simple" for 1-3 action tasks (click a button, scroll, navigate somewhere)
+- Use "multi-step" for complex tasks on a single site requiring 4+ actions
+- Use "multi-tab-parallel" ONLY when explicitly comparing/researching across 2+ different websites
+- Use "workflow-replay" only when user says "do [workflow name]" or references a saved workflow
+- Match skill semantically, not just by keywords
+- Return ONLY valid JSON, no commentary`;
+
+  const userMsg = `Intent: "${intentText}"
+Current URL: ${currentTab?.url || "unknown"}
+Page title: ${currentTab?.title || "unknown"}`;
+
+  try {
+    const raw = await callGroq("openai/gpt-oss-20b", [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMsg }
+    ], { jsonMode: true });
+
+    const decision = JSON.parse(raw);
+    broadcastEvent({ type: "ORCHESTRATOR_DONE", decision });
+    return decision;
+  } catch (e) {
+    console.error("BG: orchestrator failed", e);
+    // Fallback: treat as simple task
+    return { taskType: "simple", skill: null, steps: [], parallelSubtasks: [] };
+  }
+}
+
+// ---- Vision Action Agent Loop ----
+const VISION_SYSTEM_PROMPT = `You are a precise browser automation agent. You control a real browser via CDP.
+
+INPUTS you receive each round:
+1. An annotated screenshot with NUMBERED colored boxes over interactive elements
+2. A numbered element list matching the boxes
+3. The current task/goal
+4. Previously failed element indices (do not retry these)
+5. Data extracted so far
+
+OUTPUT: Valid JSON object with exactly these fields:
+{
+  "thought": "Brief reasoning about what you see and what to do next",
+  "actions": [...],
+  "done": false,
+  "extractedData": {}
+}
+
+ACTION TYPES:
+- {"type": "click", "elementIndex": N}
+- {"type": "type", "elementIndex": N, "value": "text", "clear": true}
+- {"type": "scroll", "direction": "down"|"up", "amount": 400}
+- {"type": "navigate", "url": "https://..."}
+- {"type": "keypress", "key": "Enter"|"Tab"|"Escape"|"ArrowDown", "elementIndex": N}
+- {"type": "select", "elementIndex": N, "value": "option text"}
+- {"type": "extract", "fields": {"price": "the displayed price", "title": "product name"}}
+- {"type": "wait", "ms": 500}
+
+RULES:
+1. Reference elements by NUMBER ONLY. Never guess coordinates.
+2. Failed elements: do not attempt them again. Find alternatives.
+3. Set done=true ONLY when the task is fully complete or truly impossible.
+4. Use extract before navigating away from pages with data you need.
+5. For SPAs: after clicking, use wait 800ms before next screenshot if content is loading.
+6. Keep thought brief — 1-2 sentences max.
+7. Return only the JSON object, nothing else.`;
+
+async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null) {
+  console.log("BG: VisionActionAgent start — tab:", tabId, "goal:", goal, "skill:", skillName);
+  const skill = skillName ? getSkill(skillName) : null;
+  const systemPrompt = VISION_SYSTEM_PROMPT + (skill?.systemPromptAddition ? "\n\n" + skill.systemPromptAddition : "");
+
+  let failedElements = [];
+  let extractedData = {};
+  let round = 0;
+  let lastThought = "";
+
+  broadcastEvent({ type: "AGENT_START", tabId, goal, skill: skillName });
+
+  while (round < MAX_ROUNDS) {
+    if (signal?.aborted) {
+      broadcastEvent({ type: "AGENT_ABORTED", tabId });
+      return { aborted: true };
+    }
+
+    round++;
+    broadcastEvent({ type: "PERCEIVING", tabId, round });
+
+    // Build annotated screenshot
+    console.log("BG: Building annotated screenshot, round", round);
+    let annotatedB64, elementList, elementMap;
+    try {
+      ({ annotatedB64, elementList, elementMap } = await buildAnnotatedScreenshot(tabId));
+      console.log("BG: Screenshot built, elements:", elementMap.size);
+    } catch (e) {
+      console.error("BG: screenshot failed", e);
+      await sleep(1000);
+      continue;
+    }
+
+    // Build prompt
+    const userContent = [
+      {
+        type: "image_url",
+        image_url: { url: `data:image/jpeg;base64,${annotatedB64}` }
+      },
+      {
+        type: "text",
+        text: [
+          `TASK: ${goal}`,
+          `Round: ${round}/${MAX_ROUNDS}`,
+          failedElements.length ? `Failed elements (do NOT retry): [${failedElements.join(", ")}]` : "",
+          Object.keys(extractedData).length ? `Data extracted so far: ${JSON.stringify(extractedData)}` : "",
+          lastThought ? `Previous thought: ${lastThought}` : "",
+          "",
+          "INTERACTIVE ELEMENTS ON PAGE:",
+          elementList
+        ].filter(Boolean).join("\n")
+      }
+    ];
+
+    // Call 120b
+    console.log("BG: Calling 120b for action decision...");
+    broadcastEvent({ type: "THINKING", tabId });
+    let response;
+    try {
+      response = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent }
+      ], { jsonMode: true });
+    } catch (e) {
+      console.error("BG: 120b call failed:", e.message);
+      broadcastEvent({ type: "ACTION_FAILED", tabId, error: e.message });
+      if (signal?.aborted) break;
+      await sleep(2000);
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(response);
+    } catch {
+      console.warn("BG: 120b returned non-JSON", response);
+      continue;
+    }
+
+    const { thought, actions = [], done = false, extractedData: newData = {} } = parsed;
+    lastThought = thought || "";
+    Object.assign(extractedData, newData);
+    console.log("BG: 120b thought:", lastThought, "| actions:", actions.length, "| done:", done);
+
+    broadcastEvent({ type: "THOUGHT", tabId, thought: lastThought });
+
+    if (done) {
+      broadcastEvent({ type: "AGENT_DONE", tabId, extractedData });
+      break;
+    }
+
+    // Execute each action
+    for (const action of actions) {
+      if (signal?.aborted) break;
+
+      // Permission check for sensitive actions
+      if (SENSITIVE_ACTIONS.has(action.type)) {
+        const desc = action.type === "navigate"
+          ? `navigate to ${action.url}`
+          : `type "${action.value}" into element ${action.elementIndex}`;
+        const perm = await showPermissionAndWait(tabId, desc);
+        if (!perm) {
+          broadcastEvent({ type: "ACTION_DENIED", tabId, action });
+          continue;
+        }
+      }
+
+      // Before screenshot for confirmation
+      let beforeB64;
+      try {
+        const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
+        beforeB64 = s.data;
+      } catch {}
+
+      broadcastEvent({ type: "EXECUTING", tabId, action, elementName: elementMap.get(action.elementIndex)?.name });
+
+      try {
+        await executeCdpAction(tabId, action, elementMap);
+      } catch (e) {
+        console.warn("BG: action failed", action, e);
+        if (action.elementIndex) failedElements.push(action.elementIndex);
+        broadcastEvent({ type: "ACTION_FAILED", tabId, action, error: e.message });
+        continue;
+      }
+
+      // Settle
+      if (action.type === "navigate") {
+        await waitForPageSettle(tabId);
+        await sleep(NAVIGATE_SETTLE_MS);
+      } else if (action.type !== "wait" && action.type !== "extract") {
+        await sleep(SETTLE_MS);
+      }
+
+      // After screenshot
+      let afterB64;
+      try {
+        const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
+        afterB64 = s.data;
+      } catch {}
+
+      // Confirm action (non-blocking for wait/extract)
+      if (action.type !== "wait" && action.type !== "extract" && beforeB64 && afterB64) {
+        runConfirmation(action, beforeB64, afterB64, tabId, failedElements);
+      } else {
+        broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
+      }
+    }
+  }
+
+  // Write result to task context if sub-agent
+  if (subAgentIndex !== null && taskContext) {
+    taskContext.tabs[subAgentIndex].extractedData = extractedData;
+    taskContext.tabs[subAgentIndex].status = "done";
+  }
+
+  return extractedData;
+}
+
+// ---- Confirmation Agent (fire-and-update, non-blocking) ----
+async function runConfirmation(action, beforeB64, afterB64, tabId, failedElements) {
+  const actionDesc = action.type === "click"
+    ? `click on element ${action.elementIndex}`
+    : action.type === "type"
+    ? `type "${action.value}" into element ${action.elementIndex}`
+    : action.type;
+
+  const prompt = `You are verifying if a browser action succeeded.
+Action taken: ${actionDesc}
+
+Compare the before and after screenshots.
+Return JSON: {"success": boolean, "observation": "brief description of what changed", "retry_hint": ""}
+
+If the page changed meaningfully (new content appeared, form submitted, navigation occurred, element state changed) → success: true.
+If nothing changed or an error appeared → success: false with retry_hint explaining what to try instead.`;
+
+  try {
+    const raw = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${beforeB64}` } },
+          { type: "text", text: "AFTER:" },
+          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${afterB64}` } }
+        ]
+      }
+    ], { jsonMode: true });
+
+    const { success, observation, retry_hint } = JSON.parse(raw);
+    if (!success && action.elementIndex) {
+      failedElements.push(action.elementIndex);
+    }
+    broadcastEvent({
+      type: success ? "ACTION_VERIFIED" : "ACTION_FAILED",
+      tabId, action, observation, retry_hint
+    });
+  } catch (e) {
+    // Confirmation failed — assume success to not block the loop
+    broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
+  }
+}
+
+// ---- Permission banner ----
+async function showPermissionAndWait(tabId, description) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { type: "SHOW_PERMISSION", description }, (resp) => {
+      if (chrome.runtime.lastError) {
+        resolve(true); // auto-grant if content script unavailable
+      } else {
+        resolve(resp === "GRANT");
+      }
+    });
+  });
+}
+
+// ---- Multi-tab task runner ----
+async function runMultiTabTask(decision, intentText, signal) {
+  const { parallelSubtasks = [], skill } = decision;
+  if (!parallelSubtasks.length) return null;
+
+  const taskId = crypto.randomUUID();
+  const taskContext = {
+    taskId,
+    goalText: intentText,
+    skill,
+    status: "executing",
+    tabs: parallelSubtasks.map((sub, i) => ({
+      tabId: null, url: sub.startUrl, subGoal: sub.subGoal, status: "pending", extractedData: {}
+    })),
+    actionLog: [],
+    startTime: Date.now()
+  };
+  taskContexts.set(taskId, taskContext);
+
+  // Create tabs
+  const tabIds = await Promise.all(parallelSubtasks.map(async (sub, i) => {
+    const tab = await chrome.tabs.create({ url: sub.startUrl, active: false });
+    taskContext.tabs[i].tabId = tab.id;
+    return tab.id;
+  }));
+
+  // Group tabs
+  try {
+    const groupId = await chrome.tabs.group({ tabIds });
+    await chrome.tabGroups.update(groupId, {
+      title: `ctrl: ${intentText.slice(0, 25)}`,
+      color: "blue",
+      collapsed: false
+    });
+  } catch {}
+
+  broadcastEvent({ type: "TASK_STARTED", taskId, tabs: taskContext.tabs });
+
+  // Run sub-agents in parallel
+  const results = await Promise.allSettled(tabIds.map((tabId, i) =>
+    runVisionActionAgent(tabId, parallelSubtasks[i].subGoal, skill, taskContext, i, signal)
+  ));
+
+  // Merge results
+  const extractedParts = results.map((r, i) =>
+    r.status === "fulfilled" ? taskContext.tabs[i].extractedData : { error: r.reason?.message }
+  );
+
+  try {
+    const mergePrompt = `The user asked: "${intentText}"
+
+Data collected from each source:
+${extractedParts.map((d, i) => `Source ${i + 1} (${parallelSubtasks[i].startUrl}): ${JSON.stringify(d)}`).join("\n")}
+
+Write a clear, concise answer comparing the data. Be specific with numbers and names.`;
+
+    const summary = await callGroq("openai/gpt-oss-20b", [
+      { role: "user", content: mergePrompt }
+    ]);
+
+    taskContext.status = "done";
+    broadcastEvent({ type: "TASK_COMPLETE", taskId, summary });
+    sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+    return summary;
+  } catch (e) {
+    taskContext.status = "failed";
+    broadcastEvent({ type: "TASK_FAILED", taskId, error: e.message });
+    sendToGeminiLive(`[TASK_FAILED: Could not merge results]`);
+    return null;
+  }
+}
+
+// ---- Main task dispatcher (called from sidepanel via DISPATCH_TASK message) ----
+async function dispatchTask(intentText, currentTab) {
+  console.log("BG: dispatchTask:", intentText, "| tab:", currentTab?.url);
+  // Abort any running task
+  if (abortController) abortController.abort();
+  abortController = new AbortController();
+  const { signal } = abortController;
+
+  broadcastEvent({ type: "TASK_DISPATCHED", intentText });
+
+  let decision;
+  try {
+    decision = await runOrchestrator(intentText, currentTab);
+  } catch (e) {
+    broadcastEvent({ type: "TASK_FAILED", error: "Orchestrator error: " + e.message });
+    return;
+  }
+
+  if (signal.aborted) return;
+
+  const { taskType, skill, steps, parallelSubtasks } = decision;
+
+  if (taskType === "workflow-replay") {
+    await replayWorkflow(decision.workflowName, currentTab?.id, signal);
+    return;
+  }
+
+  if (taskType === "multi-tab-parallel") {
+    await runMultiTabTask(decision, intentText, signal);
+    return;
+  }
+
+  // Single-tab tasks (simple or multi-step)
+  const tabId = currentTab?.id;
+  if (!tabId) {
+    broadcastEvent({ type: "TASK_FAILED", error: "No active tab" });
+    return;
+  }
+
+  if (taskType === "simple" || !steps?.length) {
+    const result = await runVisionActionAgent(tabId, intentText, skill, null, null, signal);
+    if (!signal.aborted) {
+      const summary = typeof result === "object" && Object.keys(result).length
+        ? `Done. ${JSON.stringify(result)}`
+        : "Done.";
+      sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+    }
+    return;
+  }
+
+  // Multi-step: run steps sequentially
+  for (let i = 0; i < steps.length; i++) {
+    if (signal.aborted) break;
+    broadcastEvent({ type: "STEP_START", step: i + 1, total: steps.length, desc: steps[i] });
+    await runVisionActionAgent(tabId, steps[i], skill, null, null, signal);
+    broadcastEvent({ type: "STEP_DONE", step: i + 1, total: steps.length });
+  }
+
+  if (!signal.aborted) {
+    sendToGeminiLive(`[TASK_DONE: Completed all ${steps.length} steps for: ${intentText}]`);
+  }
+}
+
+// ---- Workflow recording storage ----
+async function saveWorkflow(name, steps) {
+  const { workflows = {} } = await chrome.storage.local.get("workflows");
+  workflows[name.toLowerCase().replace(/\s+/g, "-")] = { name, steps, createdAt: Date.now() };
+  await chrome.storage.local.set({ workflows });
+}
+
+async function replayWorkflow(workflowName, tabId, signal) {
+  const { workflows = {} } = await chrome.storage.local.get("workflows");
+  const key = workflowName?.toLowerCase().replace(/\s+/g, "-");
+  const wf = workflows[key] || Object.values(workflows).find(w =>
+    w.name.toLowerCase().includes(workflowName?.toLowerCase())
+  );
+
+  if (!wf) {
+    sendToGeminiLive(`[TASK_FAILED: No workflow named "${workflowName}" found]`);
+    return;
+  }
+
+  broadcastEvent({ type: "WORKFLOW_REPLAY_START", name: wf.name });
+
+  for (const step of wf.steps) {
+    if (signal?.aborted) break;
+    // Find element by role + name in AXTree, then execute
+    try {
+      const { nodes } = await cdp(tabId, "Accessibility.getFullAXTree");
+      const match = nodes.find(n =>
+        n.role?.value === step.elementRole &&
+        (n.name?.value || "").toLowerCase().includes(step.elementName?.toLowerCase())
+      );
+      if (match) {
+        const { model } = await cdp(tabId, "DOM.getBoxModel", { backendNodeId: match.backendDOMNodeId });
+        const border = model.border;
+        const x = Math.min(border[0], border[2], border[4], border[6]);
+        const y = Math.min(border[1], border[3], border[5], border[7]);
+        const w = Math.max(border[0], border[2], border[4], border[6]) - x;
+        const h = Math.max(border[1], border[3], border[5], border[7]) - y;
+        const fakeEl = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h), backendNodeId: match.backendDOMNodeId };
+        const fakeMap = new Map([[1, fakeEl]]);
+        await executeCdpAction(tabId, { ...step, elementIndex: 1 }, fakeMap);
+        await sleep(SETTLE_MS);
+      }
+    } catch (e) {
+      console.warn("BG: workflow step failed", step, e);
+    }
+  }
+
+  broadcastEvent({ type: "WORKFLOW_REPLAY_DONE", name: wf.name });
+  sendToGeminiLive(`[TASK_DONE: Completed workflow "${wf.name}"]`);
+}
+
+// ---- Utility ----
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ---- Message Handler ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "CONNECT_WEBSOCKET") {
-    connectWebSocket(message.apiKey);
+    connectGeminiLive(message.apiKey);
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "DISCONNECT_WEBSOCKET") {
+    intentionalClose = true;
+    geminiSocket?.close();
+    geminiSocket = null;
+    intentionalClose = false;
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "SET_GROQ_KEY") {
+    groqApiKey = message.apiKey;
+    chrome.storage.local.set({ groq_key: message.apiKey });
+    console.log("BG: Groq key set");
     sendResponse({ success: true });
     return;
   }
 
   if (message.type === "SEND_TO_GEMINI") {
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify(message.data));
+    if (geminiSocket?.readyState === WebSocket.OPEN) {
+      geminiSocket.send(JSON.stringify(message.data));
       sendResponse({ success: true });
     } else {
       sendResponse({ success: false, error: "WebSocket not open" });
@@ -160,78 +1095,70 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
-  // --- MIC via offscreen ---
   if (message.type === "START_MIC") {
     ensureOffscreen().then(() => {
-      // Small delay to let offscreen page load
       setTimeout(() => {
         chrome.runtime.sendMessage({ type: "OFFSCREEN_START_MIC" }).catch(() => {});
       }, 300);
       sendResponse({ success: true });
-    }).catch(e => {
-      console.error("BG: offscreen create failed", e);
-      sendResponse({ success: false, error: e.message });
-    });
+    }).catch(e => sendResponse({ success: false, error: e.message }));
     return true;
   }
 
   if (message.type === "STOP_MIC") {
     chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_MIC" }).catch(() => {});
     setTimeout(() => closeOffscreen(), 500);
-    // Tell Gemini we stopped sending audio
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        clientContent: { turns: [], turnComplete: true }
-      }));
+    if (geminiSocket?.readyState === WebSocket.OPEN) {
+      geminiSocket.send(JSON.stringify({ clientContent: { turns: [], turnComplete: true } }));
     }
     sendResponse({ success: true });
     return;
   }
 
-  // --- Audio chunks forwarded from offscreen to Gemini ---
   if (message.type === "AUDIO_CHUNK") {
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
+    if (geminiSocket?.readyState === WebSocket.OPEN) {
+      geminiSocket.send(JSON.stringify({
         realtimeInput: {
           mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: message.data }]
         }
       }));
     }
-    // Flash mic indicator in panel
-    broadcastToPanel({ type: "MIC_CHUNK_SENT" });
     return;
   }
 
-  // Mic ready/error forwarded from offscreen to panel
-  if (message.type === "MIC_READY") {
-    broadcastToPanel({ type: "MIC_READY" });
-    return;
-  }
-  if (message.type === "MIC_ERROR") {
-    broadcastToPanel({ type: "MIC_ERROR", error: message.error });
-    return;
-  }
+  if (message.type === "MIC_READY") { broadcastRaw({ type: "MIC_READY" }); return; }
+  if (message.type === "MIC_ERROR") { broadcastRaw({ type: "MIC_ERROR", error: message.error }); return; }
 
-  // --- Screen capture ---
-  if (message.type === "CAPTURE_SCREEN") {
-    chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 75 }, (dataUrl) => {
-      if (chrome.runtime.lastError || !dataUrl) {
-        sendResponse({ success: false, error: chrome.runtime.lastError?.message });
-        return;
-      }
-      sendResponse({ success: true, data: dataUrl.split(",")[1] });
+  // Dispatch a task from sidepanel (called when INTENT_DETECTED received by panel)
+  if (message.type === "DISPATCH_TASK") {
+    console.log("BG: DISPATCH_TASK received:", message.intentText);
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      console.log("BG: Active tab:", tab?.url);
+      dispatchTask(message.intentText, tab).catch(e => console.error("BG: dispatchTask error:", e));
     });
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "ABORT_TASK") {
+    abortController?.abort();
+    broadcastEvent({ type: "TASK_ABORTED" });
+    sendToGeminiLive("[TASK_FAILED: Task was cancelled by user]");
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "SAVE_WORKFLOW") {
+    saveWorkflow(message.name, message.steps).then(() => sendResponse({ success: true }));
     return true;
   }
 
-  // --- DOM preview ---
   if (message.type === "GET_DOM_PREVIEW") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0] || tabs[0].url?.startsWith("chrome://")) {
         sendResponse({ nodes: [], title: "", url: "" });
         return;
       }
-      await ensureContentScript(tabs[0].id);
       chrome.tabs.sendMessage(tabs[0].id, { type: "GET_DOM_PREVIEW", maxNodes: message.maxNodes || 60 }, (resp) => {
         sendResponse(resp || { nodes: [], title: "", url: "" });
       });
@@ -239,65 +1166,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // --- Execute browser action ---
-  if (message.type === "EXECUTE_ACTION") {
-    // Tab management actions are handled here — no content script needed
-    if (message.kind === "new_tab") {
-      const url = message.value && message.value.startsWith("http") ? message.value : undefined;
-      chrome.tabs.create({ url, active: true }, () => sendResponse({ success: true }));
-      return true;
-    }
-    if (message.kind === "switch_tab") {
-      chrome.tabs.query({ currentWindow: true }, (tabs) => {
-        const q = (message.value || "").toLowerCase();
-        const target = tabs.find(t =>
-          t.title?.toLowerCase().includes(q) || t.url?.toLowerCase().includes(q)
-        );
-        if (target) {
-          chrome.tabs.update(target.id, { active: true }, () => sendResponse({ success: true }));
-        } else {
-          sendResponse({ success: false, error: `No tab matching "${message.value}"` });
-        }
-      });
-      return true;
-    }
-    if (message.kind === "close_tab") {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]) chrome.tabs.remove(tabs[0].id, () => sendResponse({ success: true }));
-        else sendResponse({ success: false, error: "No active tab" });
-      });
-      return true;
-    }
-
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      if (!tabs[0]) { sendResponse({ success: false, error: "No active tab" }); return; }
-      if (tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
-        sendResponse({ success: false, error: "Cannot execute on chrome:// pages" }); return;
-      }
-      await ensureContentScript(tabs[0].id);
-      chrome.tabs.sendMessage(
-        tabs[0].id,
-        { type: "EXECUTE", kind: message.kind, selector: message.selector, value: message.value },
-        (resp) => {
-          if (chrome.runtime.lastError) {
-            sendResponse({ success: false, error: chrome.runtime.lastError.message });
-          } else {
-            sendResponse(resp || { success: false, error: "No response from content script" });
-          }
-        }
-      );
-    });
-    return true;
-  }
-
-  // --- Permission banner ---
   if (message.type === "SHOW_PERMISSION") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
-        sendResponse("GRANT"); // auto-grant if we can't show banner
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0] || tabs[0].url?.startsWith("chrome://")) {
+        sendResponse("GRANT");
         return;
       }
-      await ensureContentScript(tabs[0].id);
       chrome.tabs.sendMessage(tabs[0].id, { type: "SHOW_PERMISSION", description: message.description }, (resp) => {
         sendResponse(chrome.runtime.lastError ? "DENY" : (resp || "DENY"));
       });
@@ -305,65 +1179,81 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // --- Unified Gemini REST call (action planning + task decomposition) ---
-  if (message.type === "CALL_GEMINI") {
-    const model = message.model || "gemini-2.5-flash-lite";
-    const parts = (message.parts || [{ text: message.prompt || "" }]).map(p =>
-      p.inline_data ? { inlineData: { mimeType: p.inline_data.mime_type, data: p.inline_data.data } } : p
-    );
-    const body = {
-      contents: [{ parts }],
-      generationConfig: {
-        temperature: message.temperature ?? 0,
-        maxOutputTokens: message.maxTokens || 512,
-        responseMimeType: "application/json",
-        responseSchema: message.schema
-      }
-    };
-    fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-    )
-      .then(r => r.json())
-      .then(data => {
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!text) {
-          console.error("BG: CALL_GEMINI empty:", JSON.stringify(data).slice(0, 400));
-          sendResponse({ success: false, error: data?.error?.message || "Empty response" });
-          return;
-        }
-        try { sendResponse({ success: true, data: JSON.parse(text) }); }
-        catch (e) { sendResponse({ success: false, error: "JSON parse failed: " + e.message }); }
-      })
-      .catch(e => sendResponse({ success: false, error: e.message }));
-    return true;
-  }
-
-  // --- Page ready check (for smart settle after navigation) ---
-  if (message.type === "READY_CHECK") {
-    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
-      if (!tabs[0] || tabs[0].url.startsWith("chrome://") || tabs[0].url.startsWith("chrome-extension://")) {
-        sendResponse({ ready: false });
-        return;
-      }
-      await ensureContentScript(tabs[0].id);
-      chrome.tabs.sendMessage(tabs[0].id, { type: "READY_CHECK" }, (resp) => {
-        sendResponse(chrome.runtime.lastError ? { ready: false } : (resp || { ready: false }));
-      });
-    });
-    return true;
-  }
-
-  // --- OS action via native host ---
+  // OS action via native host
   if (message.type === "OS_ACTION") {
-    const port = getNativePort();
-    if (!port) { sendResponse({ success: false, error: "Native host not running" }); return; }
+    if (!nativePort) {
+      try {
+        nativePort = chrome.runtime.connectNative("com.ctrl.ai_agent_host");
+        nativePort.onDisconnect.addListener(() => { nativePort = null; });
+      } catch { nativePort = null; }
+    }
+    if (!nativePort) { sendResponse({ success: false, error: "Native host not running" }); return; }
     try {
-      port.postMessage({ type: "os_action", kind: message.kind, payload: message.payload || {} });
+      nativePort.postMessage({ type: "os_action", kind: message.kind, payload: message.payload || {} });
       sendResponse({ success: true });
     } catch (e) {
       sendResponse({ success: false, error: e.message });
     }
     return;
   }
+
+  // Direct CDP passthrough (for panel to query page state)
+  if (message.type === "CDP") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async ([tab]) => {
+      if (!tab) { sendResponse({ ok: false, error: "no active tab" }); return; }
+      try {
+        const result = await cdp(tab.id, message.cmd, message.params || {});
+        sendResponse({ ok: true, data: result });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    });
+    return true;
+  }
+
+  // Install community skill
+  if (message.type === "INSTALL_SKILL") {
+    installCommunitySkill(message.url).then(r => sendResponse(r)).catch(e => sendResponse({ success: false, error: e.message }));
+    return true;
+  }
+
+  if (message.type === "GET_SKILLS") {
+    sendResponse({ skills: getSkillManifest() });
+    return;
+  }
 });
+
+// ---- Community skill installation ----
+const BANNED_PATTERNS = ["eval(", "Function(", "chrome.storage.clear", "document.cookie"];
+
+async function installCommunitySkill(url) {
+  if (!url.startsWith("https://raw.githubusercontent.com/") &&
+      !url.startsWith("https://gist.githubusercontent.com/")) {
+    return { success: false, error: "Only GitHub raw URLs are allowed" };
+  }
+
+  const resp = await fetch(url);
+  if (!resp.ok) return { success: false, error: `Fetch failed: ${resp.status}` };
+  const code = await resp.text();
+
+  for (const banned of BANNED_PATTERNS) {
+    if (code.includes(banned)) {
+      return { success: false, error: `Skill uses banned API: ${banned}` };
+    }
+  }
+
+  // Extract name from code (basic)
+  const nameMatch = code.match(/name\s*:\s*["']([^"']+)["']/);
+  const name = nameMatch?.[1] || "community-skill";
+
+  const { communitySkillsData = [] } = await chrome.storage.local.get("communitySkillsData");
+  // Remove existing skill with same name
+  const filtered = communitySkillsData.filter(s => s.name !== name);
+  filtered.push({ url, name, code, installedAt: Date.now() });
+  await chrome.storage.local.set({ communitySkillsData: filtered });
+
+  // Re-init skill registry to pick up new skill
+  await initSkillRegistry();
+
+  return { success: true, name };
+}

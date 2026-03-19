@@ -1,20 +1,23 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Browser AI Agent",
-  "version": "1.0",
-  "description": "AI agent powered by Gemini Live API",
+  "name": "ctrl",
+  "version": "2.0",
+  "description": "Voice-first browser automation agent powered by Groq + Gemini Live",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "tabs",
+    "tabGroups",
     "sidePanel",
     "offscreen",
-    "nativeMessaging"
+    "nativeMessaging",
+    "debugger"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
@@ -23,11 +26,11 @@
       "run_at": "document_idle"
     }
   ],
-  "action": { "default_title": "Open AI Agent" },
+  "action": { "default_title": "Open ctrl" },
   "side_panel": { "default_path": "sidepanel.html" },
   "web_accessible_resources": [
     {
-      "resources": ["audio-processor.js", "offscreen.html"],
+      "resources": ["audio-processor.js", "offscreen.html", "skills/*.js"],
       "matches": ["<all_urls>"]
     }
   ]
