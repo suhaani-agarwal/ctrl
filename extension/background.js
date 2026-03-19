@@ -18,6 +18,7 @@ let reconnectCount = 0;
 const MAX_RECONNECTS = 3;
 let nativePort = null;
 let abortController = null; // abort current task loop
+let pendingTask = null;     // { intentText, decision, tab, step: "clarify"|"confirm" }
 
 // CDP: tabId → { attached: boolean }
 const cdpSessions = new Map();
@@ -29,7 +30,7 @@ const taskContexts = new Map();
 
 // ---- Init ----
 chrome.action.onClicked.addListener((tab) => chrome.sidePanel.open({ windowId: tab.windowId }));
-chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => { });
 
 // Load skills and restore API keys on startup (service workers restart frequently)
 async function onStartup() {
@@ -43,10 +44,10 @@ onStartup();
 // ---- Event broadcast ----
 // Sends { type: "AGENT_EVENT", event: { type, ...fields } } to the side panel.
 function broadcastEvent(event) {
-  chrome.runtime.sendMessage({ type: "AGENT_EVENT", event }).catch(() => {});
+  chrome.runtime.sendMessage({ type: "AGENT_EVENT", event }).catch(() => { });
 }
 function broadcastRaw(msg) {
-  chrome.runtime.sendMessage(msg).catch(() => {});
+  chrome.runtime.sendMessage(msg).catch(() => { });
 }
 
 // ---- Gemini Live WebSocket ----
@@ -86,8 +87,13 @@ function connectGeminiLive(gKey) {
               "  Speak the result in 1 natural sentence. No JSON, no lists.\n\n" +
               "RULE 4 — When you receive [TASK_FAILED: reason]:\n" +
               "  Apologize in 1 sentence and mention the reason.\n\n" +
-              "RULE 5 — Never output markdown, bullet points, bold text, or structured data in spoken responses.\n" +
-              "RULE 6 — Keep ALL spoken responses to 1-2 sentences maximum."
+              "RULE 5 — When you receive [PLAN: text]:\n" +
+              "  Read the plan out loud naturally, then ask 'Should I go ahead?' Do not add [INTENT:] here.\n\n" +
+              "RULE 6 — When you receive [QUESTION: text]:\n" +
+              "  Ask the question naturally. Do not add [INTENT:] here.\n\n" +
+              "RULE 7 — User replies like 'yes', 'no', 'cancel', 'go ahead', or platform choices ('Amazon', 'YouTube') after a [PLAN:] or [QUESTION:] are conversational replies — do NOT emit [INTENT:] for them.\n\n" +
+              "RULE 8 — Never output markdown, bullet points, bold text, or structured data in spoken responses.\n" +
+              "RULE 9 — Keep ALL spoken responses to 1-2 sentences maximum."
           }]
         }
       }
@@ -169,6 +175,16 @@ function handleGeminiLiveMessage(rawText) {
       console.log("BG: Gemini full turn:", fullText.slice(0, 200));
     }
 
+    // If waiting for user reply to a plan/clarification, route there first
+    if (pendingTask && userTranscript) {
+      const cleanForPending = userTranscript.replace(/[^\x00-\x7F\u00C0-\u024F\u1E00-\u1EFF]/g, "").replace(/\s+/g, " ").trim() || userTranscript;
+      console.log("BG: Routing to pending task handler:", cleanForPending.slice(0, 80));
+      handlePendingTaskResponse(cleanForPending);
+      if (fullText.includes("[RECORD_START]")) broadcastRaw({ type: "RECORD_START" });
+      if (fullText.includes("[RECORD_STOP]")) broadcastRaw({ type: "RECORD_STOP" });
+      return;
+    }
+
     // Primary path: model outputs [INTENT: ...]
     const intentMatch = fullText.match(/\[INTENT:\s*([\s\S]+?)(?:\]|$)/);
     if (intentMatch) {
@@ -179,19 +195,42 @@ function handleGeminiLiveMessage(rawText) {
         dispatchTask(intentText, tab).catch(e => console.error("BG: dispatchTask error:", e));
       });
     } else if (userTranscript) {
-      // Fallback: model didn't output [INTENT:], use the user's transcribed speech directly
-      console.log("BG: No [INTENT] marker, routing transcript:", userTranscript.slice(0, 80));
-      checkAndDispatchIntent(userTranscript);
+      // Strip non-Latin script characters (Hindi, Arabic, CJK etc.) — transcription artifacts
+      // when Gemini mishears audio. Keep ASCII + extended Latin (accented chars like é, ñ).
+      const cleanTranscript = userTranscript
+        .replace(/[^\x00-\x7F\u00C0-\u024F\u1E00-\u1EFF]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const textToRoute = cleanTranscript || userTranscript; // fallback to raw if cleaning wipes everything
+      console.log("BG: No [INTENT] marker, routing transcript:", textToRoute.slice(0, 80));
+      checkAndDispatchIntent(textToRoute);
     }
 
     if (fullText.includes("[RECORD_START]")) broadcastRaw({ type: "RECORD_START" });
-    if (fullText.includes("[RECORD_STOP]"))  broadcastRaw({ type: "RECORD_STOP" });
+    if (fullText.includes("[RECORD_STOP]")) broadcastRaw({ type: "RECORD_STOP" });
   }
 }
 
 // Decide if the user's speech is a browser task and dispatch directly.
 // Uses fast keyword check first, then llama-4-scout for ambiguous cases.
-const TASK_KEYWORDS = /\b(go to|navigate|open|search|click|type|fill|book|buy|find|scroll|close|play|pause|send|email|compose|compare|look up|check|download|sign in|log in|logout|submit|add to cart|checkout)\b/i;
+const TASK_KEYWORDS = new RegExp(
+  "\\b(" + [
+    "go to", "navigate", "open", "search", "click", "type", "fill",
+    "book", "buy", "purchase", "order", "shop", "shopping",
+    "find", "find me", "show me", "get me", "look for", "look up", "browse",
+    "scroll", "close", "play", "watch", "listen", "pause", "resume",
+    "send", "email", "compose", "post", "tweet", "share", "upload",
+    "compare", "check", "download",
+    "sign in", "log in", "log out", "logout", "sign out",
+    "submit", "add to cart", "checkout",
+    "read", "summarize", "translate",
+    "reddit", "twitter", "youtube", "amazon", "flipkart", "instagram", "linkedin",
+    "want to", "need to", "help me", "can you", "please", "i'd like", "i would like",
+    "schedule", "remind", "timer", "alarm", "calendar",
+    "weather", "news", "price", "stock", "flight", "hotel", "restaurant"
+  ].join("|") + ")\\b",
+  "i"
+);
 
 async function checkAndDispatchIntent(userText) {
   // Always broadcast so sidepanel can show the user transcript
@@ -206,15 +245,21 @@ async function checkAndDispatchIntent(userText) {
     return;
   }
 
-  // Ambiguous — ask llama-4-scout (very fast, ~200ms)
+  // Ambiguous — ask llama-4-scout to classify
   if (!groqApiKey) {
-    console.warn("BG: No Groq key, can't classify intent");
+    // No Groq key: assume actionable rather than silently dropping
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      dispatchTask(userText, tab).catch(e => console.error("BG: dispatchTask error:", e));
+    });
     return;
   }
   try {
     const raw = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [{
+      role: "system",
+      content: "You classify user speech. Reply ONLY with valid JSON: {\"actionable\": true} or {\"actionable\": false}.\n\nSet actionable=true if the text is asking to do ANYTHING on the web or browser: search, shop, navigate, watch, read, buy, find information, open a site, fill a form, book something, compare prices, check something online, use any website or app. When in doubt, set true."
+    }, {
       role: "user",
-      content: `Is this a browser automation request (navigate, click, search, fill form, etc.)? Reply ONLY with JSON {"actionable": true} or {"actionable": false}.\n\nText: "${userText}"`
+      content: `User said: "${userText}"`
     }], { jsonMode: true });
     const { actionable } = JSON.parse(raw);
     console.log("BG: Intent check:", userText, "→ actionable:", actionable);
@@ -225,6 +270,10 @@ async function checkAndDispatchIntent(userText) {
     }
   } catch (e) {
     console.warn("BG: Intent check failed:", e.message);
+    // On error: dispatch anyway rather than silently dropping
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      dispatchTask(userText, tab).catch(console.error);
+    });
   }
 }
 
@@ -243,7 +292,7 @@ async function ensureOffscreen() {
 async function closeOffscreen() {
   try {
     if (await chrome.offscreen.hasDocument()) await chrome.offscreen.closeDocument();
-  } catch {}
+  } catch { }
 }
 
 // ---- CDP Manager ----
@@ -253,7 +302,7 @@ chrome.debugger.onDetach.addListener((source) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (cdpSessions.get(tabId)?.attached) {
-    chrome.debugger.detach({ tabId }).catch(() => {});
+    chrome.debugger.detach({ tabId }).catch(() => { });
   }
   cdpSessions.delete(tabId);
   elementMaps.delete(tabId);
@@ -266,9 +315,9 @@ async function ensureAttached(tabId) {
   await chrome.debugger.attach({ tabId }, "1.3");
   cdpSessions.set(tabId, { attached: true });
   // Enable domains required for our pipeline
-  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
-  await chrome.debugger.sendCommand({ tabId }, "Network.enable", {}).catch(() => {});
-  await chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}).catch(() => {});
+  await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => { });
+  await chrome.debugger.sendCommand({ tabId }, "Network.enable", {}).catch(() => { });
+  await chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}).catch(() => { });
   console.log("BG: CDP attached and domains enabled for tab", tabId);
 }
 
@@ -501,7 +550,7 @@ async function executeCdpAction(tabId, action, elementMap) {
 async function waitForPageSettle(tabId, timeout = 8000) {
   try {
     await cdp(tabId, "Network.enable");
-  } catch {}
+  } catch { }
 
   return new Promise((resolve) => {
     let lastActivity = Date.now();
@@ -582,31 +631,44 @@ async function runOrchestrator(intentText, currentTab) {
   const skillManifest = getSkillManifest();
   const skillList = skillManifest.map(s => `- ${s.name}: ${s.description}`).join("\n");
 
-  const systemPrompt = `You are an intent router for a browser automation agent.
-Given the user's intent and current page context, return a JSON object with:
+  const systemPrompt = `You are an intent router for a browser automation agent. Return a JSON object with these fields:
+
 - taskType: "simple" | "multi-step" | "multi-tab-parallel" | "workflow-replay"
-- skill: the skill name that best matches (or null if none applies)
-- steps: array of step descriptions for multi-step tasks (1-5 steps)
-- parallelSubtasks: array of {subGoal, startUrl} for multi-tab-parallel tasks
-- workflowName: the workflow name if taskType is workflow-replay
+- skill: matching skill name or null
+- steps: ordered step descriptions for multi-step tasks (max 5)
+- parallelSubtasks: [{subGoal, startUrl}] for multi-tab-parallel only
+- workflowName: string for workflow-replay only
+- clarificationNeeded: true if you need more info from the user before planning
+- clarificationQuestion: the question to ask the user (short, voice-friendly, 1 sentence)
+- planSummary: a short voice-friendly summary of what you will do (1-2 sentences, spoken aloud to user before execution)
 
 Available skills:
 ${skillList}
 
 Rules:
-- Use "simple" for tasks requiring fewer than 4 actions (navigate somewhere, click a button, scroll, play a video)
-- Use "multi-step" for complex tasks requiring 4+ distinct actions (fill a form, complete a checkout, etc.)
-- Use "multi-tab-parallel" ONLY when explicitly comparing across 2+ different websites simultaneously
-- Use "workflow-replay" only when user says "do [workflow name]" or references a saved workflow
-- Match skill semantically, not just by keywords
-- For "simple" tasks that require going to a different website, the agent will handle navigation itself — do NOT add a navigate step in steps[]
-- Return ONLY valid JSON, no commentary`;
+- "simple" = fewer than 4 actions (navigate, scroll, play, click something)
+- "multi-step" = 4+ distinct actions in sequence (fill form, book something, complete checkout)
+- "multi-tab-parallel" = user explicitly wants to compare across 2+ different websites at once
+- "workflow-replay" = user references a saved workflow by name
+
+Clarification rules — set clarificationNeeded=true when:
+- Intent is ambiguous about which platform to use (shopping → Amazon vs Flipkart vs eBay? / music → Spotify vs YouTube?)
+- Intent is vague about what exactly to do (e.g. "find something good" with no domain)
+- Critical information is missing (searching for what? buying what?)
+- Do NOT ask for clarification when the intent is already clear enough to act on
+
+planSummary rules:
+- Always populate this, even for simple tasks
+- Write as if you're telling the user what you're about to do
+- Example: "I'll navigate to YouTube and search for cat videos."
+- Example: "I'll fill out the registration form with your details in 3 steps."
+
+The vision agent handles all navigation — just describe WHAT to do, not HOW to navigate.
+Return ONLY valid JSON.`;
 
   const userMsg = `Intent: "${intentText}"
 Current URL: ${currentTab?.url || "unknown"}
-Page title: ${currentTab?.title || "unknown"}
-
-Important: if the task requires a website the user is NOT currently on, the vision agent will navigate there automatically. You just need to describe WHAT to do, not HOW to navigate.`;
+Page title: ${currentTab?.title || "unknown"}`;
 
   try {
     const raw = await callGroq("openai/gpt-oss-20b", [
@@ -706,7 +768,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       const tab = await chrome.tabs.get(tabId);
       currentUrl = tab.url || "unknown";
       currentTitle = tab.title || "unknown";
-    } catch {}
+    } catch { }
 
     // Build prompt
     const userContent = [
@@ -789,7 +851,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       try {
         const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
         beforeB64 = s.data;
-      } catch {}
+      } catch { }
 
       broadcastEvent({ type: "EXECUTING", tabId, action, elementName: elementMap.get(action.elementIndex)?.name });
 
@@ -815,7 +877,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       try {
         const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
         afterB64 = s.data;
-      } catch {}
+      } catch { }
 
       // Confirm action (non-blocking for wait/extract)
       if (action.type !== "wait" && action.type !== "extract" && beforeB64 && afterB64) {
@@ -840,8 +902,8 @@ async function runConfirmation(action, beforeB64, afterB64, tabId, failedElement
   const actionDesc = action.type === "click"
     ? `click on element ${action.elementIndex}`
     : action.type === "type"
-    ? `type "${action.value}" into element ${action.elementIndex}`
-    : action.type;
+      ? `type "${action.value}" into element ${action.elementIndex}`
+      : action.type;
 
   const prompt = `You are verifying if a browser action succeeded.
 Action taken: ${actionDesc}
@@ -926,7 +988,7 @@ async function runMultiTabTask(decision, intentText, signal) {
       color: "blue",
       collapsed: false
     });
-  } catch {}
+  } catch { }
 
   broadcastEvent({ type: "TASK_STARTED", taskId, tabs: taskContext.tabs });
 
@@ -964,13 +1026,11 @@ Write a clear, concise answer comparing the data. Be specific with numbers and n
   }
 }
 
-// ---- Main task dispatcher (called from sidepanel via DISPATCH_TASK message) ----
+// ---- Main task dispatcher ----
 async function dispatchTask(intentText, currentTab) {
   console.log("BG: dispatchTask:", intentText, "| tab:", currentTab?.url);
-  // Abort any running task
   if (abortController) abortController.abort();
   abortController = new AbortController();
-  const { signal } = abortController;
 
   broadcastEvent({ type: "TASK_DISPATCHED", intentText });
 
@@ -982,7 +1042,42 @@ async function dispatchTask(intentText, currentTab) {
     return;
   }
 
-  if (signal.aborted) return;
+  if (abortController.signal.aborted) return;
+
+  // Need clarification before planning
+  if (decision.clarificationNeeded && decision.clarificationQuestion) {
+    console.log("BG: Clarification needed:", decision.clarificationQuestion);
+    pendingTask = { intentText, decision, tab: currentTab, step: "clarify" };
+    broadcastEvent({ type: "PLAN_ANNOUNCED", planText: decision.clarificationQuestion });
+    sendToGeminiLive(`[QUESTION: ${decision.clarificationQuestion}]`);
+    return;
+  }
+
+  // Multi-step: announce plan and ask for confirmation before executing
+  if (decision.taskType === "multi-step" && decision.steps?.length) {
+    const planText = decision.planSummary ||
+      `I'll complete this in ${decision.steps.length} steps: ${decision.steps.join(", then ")}. Should I go ahead?`;
+    console.log("BG: Announcing plan:", planText);
+    pendingTask = { intentText, decision, tab: currentTab, step: "confirm" };
+    broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
+    sendToGeminiLive(`[PLAN: ${planText}]`);
+    return;
+  }
+
+  // Simple tasks: announce briefly then execute immediately
+  if (decision.planSummary) {
+    sendToGeminiLive(`[PLAN: ${decision.planSummary}]`);
+    await sleep(300); // brief pause so Gemini starts speaking before we act
+  }
+
+  await executePlan(decision, intentText, currentTab);
+}
+
+// ---- Execute a decided plan ----
+async function executePlan(decision, intentText, currentTab) {
+  if (abortController) abortController.abort();
+  abortController = new AbortController();
+  const { signal } = abortController;
 
   const { taskType, skill, steps, parallelSubtasks } = decision;
 
@@ -996,7 +1091,6 @@ async function dispatchTask(intentText, currentTab) {
     return;
   }
 
-  // Single-tab tasks (simple or multi-step)
   const tabId = currentTab?.id;
   if (!tabId) {
     broadcastEvent({ type: "TASK_FAILED", error: "No active tab" });
@@ -1024,6 +1118,48 @@ async function dispatchTask(intentText, currentTab) {
 
   if (!signal.aborted) {
     sendToGeminiLive(`[TASK_DONE: Completed all ${steps.length} steps for: ${intentText}]`);
+  }
+}
+
+// ---- Handle user reply to a pending plan/clarification ----
+const CONFIRM_YES = /\b(yes|yeah|yep|yup|sure|ok|okay|go|proceed|do it|let's go|let's do it|continue|sounds good|go ahead|perfect|great|fine|correct|right|exactly)\b/i;
+const CONFIRM_NO  = /\b(no|nope|nah|cancel|stop|don't|abort|nevermind|never mind|wait|hold on|actually)\b/i;
+
+async function handlePendingTaskResponse(userText) {
+  if (!pendingTask) return;
+  const { intentText, decision, tab, step } = pendingTask;
+  pendingTask = null;
+
+  if (step === "clarify") {
+    // User answered the clarification — re-orchestrate with the enriched intent
+    const enriched = `${intentText} — user specified: ${userText}`;
+    console.log("BG: Clarification received, re-dispatching:", enriched);
+    broadcastRaw({ type: "INTENT_DETECTED", intentText: enriched });
+    chrome.tabs.query({ active: true, currentWindow: true }, ([activeTab]) => {
+      dispatchTask(enriched, activeTab || tab).catch(console.error);
+    });
+    return;
+  }
+
+  if (step === "confirm") {
+    if (CONFIRM_NO.test(userText)) {
+      console.log("BG: Plan rejected by user");
+      sendToGeminiLive("[TASK_FAILED: Cancelled by user]");
+      broadcastEvent({ type: "TASK_ABORTED" });
+      return;
+    }
+    if (CONFIRM_YES.test(userText)) {
+      console.log("BG: Plan confirmed, executing");
+      await executePlan(decision, intentText, tab);
+      return;
+    }
+    // User gave a modification (e.g. "but use Flipkart instead")
+    const enriched = `${intentText} — modified: ${userText}`;
+    console.log("BG: Plan modified:", enriched);
+    broadcastRaw({ type: "INTENT_DETECTED", intentText: enriched });
+    chrome.tabs.query({ active: true, currentWindow: true }, ([activeTab]) => {
+      dispatchTask(enriched, activeTab || tab).catch(console.error);
+    });
   }
 }
 
@@ -1120,7 +1256,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "START_MIC") {
     ensureOffscreen().then(() => {
       setTimeout(() => {
-        chrome.runtime.sendMessage({ type: "OFFSCREEN_START_MIC" }).catch(() => {});
+        chrome.runtime.sendMessage({ type: "OFFSCREEN_START_MIC" }).catch(() => { });
       }, 300);
       sendResponse({ success: true });
     }).catch(e => sendResponse({ success: false, error: e.message }));
@@ -1128,7 +1264,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "STOP_MIC") {
-    chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_MIC" }).catch(() => {});
+    chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_MIC" }).catch(() => { });
     setTimeout(() => closeOffscreen(), 500);
     if (geminiSocket?.readyState === WebSocket.OPEN) {
       geminiSocket.send(JSON.stringify({ clientContent: { turns: [], turnComplete: true } }));
@@ -1163,6 +1299,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "ABORT_TASK") {
+    pendingTask = null;
     abortController?.abort();
     broadcastEvent({ type: "TASK_ABORTED" });
     sendToGeminiLive("[TASK_FAILED: Task was cancelled by user]");
@@ -1250,7 +1387,7 @@ const BANNED_PATTERNS = ["eval(", "Function(", "chrome.storage.clear", "document
 
 async function installCommunitySkill(url) {
   if (!url.startsWith("https://raw.githubusercontent.com/") &&
-      !url.startsWith("https://gist.githubusercontent.com/")) {
+    !url.startsWith("https://gist.githubusercontent.com/")) {
     return { success: false, error: "Only GitHub raw URLs are allowed" };
   }
 

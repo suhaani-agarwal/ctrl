@@ -247,6 +247,16 @@ function handleAgentEvent(event) {
       abortBtn.classList.remove("hidden");
       break;
 
+    case "PLAN_ANNOUNCED":
+      setStatus("listening");
+      if (event.steps?.length) {
+        stepCounter.textContent = `${event.steps.length} steps planned`;
+        stepCounter.classList.remove("hidden");
+      }
+      appendLog("📋", event.planText, "thinking");
+      appendTranscript("agent", `📋 ${event.planText}`);
+      break;
+
     case "TASK_STARTED":
       setStatus("acting");
       if (event.tabs?.length) {
