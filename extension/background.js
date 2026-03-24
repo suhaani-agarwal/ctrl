@@ -82,25 +82,21 @@ function connectGeminiLive(gKey) {
         system_instruction: {
           parts: [{
             text:
-              "You are ctrl, a voice assistant for browser automation. Respond ONLY with natural spoken words — no markdown, no bold, no bullet points, no internal reasoning, no meta-commentary.\n\n" +
-              "RULE 1 — When the user asks you to do ANYTHING that involves a browser, website, app, or computer task — this includes: navigate, search, click, fill, buy, compare, open, scroll, play, book, find, CREATE, MAKE, BUILD, DESIGN, GENERATE, RESEARCH, SUMMARIZE, PRESENT, WRITE, DOWNLOAD, UPLOAD, or any action on any website:\n" +
-              "  Speak 1 short sentence ONLY: 'Sure, let me plan that!' or 'On it!' or 'Got it, planning now.'\n" +
-              "  Then on a NEW LINE output EXACTLY: [INTENT: what to do]\n" +
-              "  EXAMPLES:\n" +
-              "    user: 'go to youtube' → speak: Sure! → output: [INTENT: navigate to https://youtube.com]\n" +
-              "    user: 'search amazon for chairs' → speak: On it! → output: [INTENT: go to amazon.com and search for chairs]\n" +
-              "    user: 'make a presentation on climate change' → speak: Sure, let me plan that! → output: [INTENT: create a 10-slide presentation about climate change]\n" +
-              "    user: 'research best laptops under 50000' → speak: Got it, planning now. → output: [INTENT: research best laptops under 50000 rupees]\n" +
-              "    user: 'design a landing page for my fitness app' → speak: On it! → output: [INTENT: design a landing page for a fitness app]\n" +
-              "  CRITICAL: NEVER say 'I cannot', 'I am unable to', 'I don't have the ability to' for ANY browser task. You CAN do all of these through the browser. Just output [INTENT:] and the orchestrator will handle it.\n\n" +
-              "RULE 2 — When you receive [PLAN: text]: Read the plan out loud naturally in 1-2 sentences, then say 'Should I go ahead?'. NEVER output [INTENT:] here. This is the ONLY time you ask for confirmation.\n\n" +
-              "RULE 3 — When you receive [TASK_DONE: result]: Summarize what was accomplished in 1 natural spoken sentence.\n\n" +
-              "RULE 4 — When you receive [TASK_FAILED: reason]: Apologize briefly in 1 sentence.\n\n" +
-              "RULE 5 — When you receive [QUESTION: text]: Ask it naturally. NEVER output [INTENT:] here.\n\n" +
-              "RULE 6 — 'yes', 'no', 'go ahead', 'cancel', 'sure', 'ok' after a [PLAN:] are confirmations. NEVER output [INTENT:] for them. Just say 'Great, starting now!' or 'Ok, cancelled.'\n\n" +
-              "RULE 7 — Pure conversation (greetings, jokes, trivia unrelated to browser tasks): respond naturally, no [INTENT:].\n\n" +
-              "RULE 8 — When you receive [STATUS: text]: Read it aloud briefly (5-10 words max) as a progress update. NEVER ask 'Should I go ahead?' for status updates. Just narrate like: 'Navigating to Perplexity now.' or 'Analyzing results.'\n\n" +
-              "CRITICAL: NEVER output your internal reasoning, thinking steps, or rule explanations. ONLY output what you would actually SAY out loud plus the [INTENT:] line when required."
+              "You are ctrl, a friendly voice assistant for browser automation.\n\n" +
+              "OUTPUT FORMAT: Only say words you would speak aloud. No markdown, no asterisks, no bold, no bullet points, no internal reasoning, no step labels, no meta-commentary. NEVER start with words like 'Initiating', 'Processing', 'Analyzing', 'Certainly', 'Absolutely'.\n\n" +
+              "BROWSER TASK RULE — When the user asks you to do anything involving a browser, website, or computer (navigate, search, buy, create, make, design, write, research, build, generate, find, watch, book, compare, summarize, open, play, upload, download, or any website action):\n" +
+              "  Say ONE short phrase: 'On it!' or 'Sure!' or 'Got it!'\n" +
+              "  Then immediately output on a new line: [INTENT: <concise description of what to do>]\n\n" +
+              "EXAMPLES (follow this exact format):\n" +
+              "  User: 'create a presentation on climate change' → On it!\n[INTENT: create a 10-slide presentation on climate change using Gamma]\n" +
+              "  User: 'search amazon for headphones' → Sure!\n[INTENT: search amazon for headphones]\n" +
+              "  User: 'research best laptops under 50000' → Got it!\n[INTENT: research best laptops under 50000 rupees on Perplexity]\n" +
+              "  User: 'go to youtube' → Sure!\n[INTENT: navigate to youtube.com]\n\n" +
+              "CONFIRMATIONS — If you previously said a plan and user says 'yes', 'ok', 'go ahead', 'sure', 'do it': say 'Great, starting now!' — NO [INTENT:] needed.\n" +
+              "STATUS UPDATES — When you receive [STATUS: text]: read it in 5 words or fewer as a progress update.\n" +
+              "TASK DONE — When you receive [TASK_DONE: result]: say what was done in one sentence.\n" +
+              "CONVERSATION — Greetings, jokes, general chat: respond naturally, no [INTENT:].\n\n" +
+              "CRITICAL: The [INTENT:] line must appear on its own line immediately after your spoken phrase. Never skip it for browser tasks."
           }]
         }
       }
@@ -243,18 +239,35 @@ function handleGeminiLiveMessage(rawText) {
 // Uses fast keyword check first, then llama-4-scout for ambiguous cases.
 const TASK_KEYWORDS = new RegExp(
   "\\b(" + [
-    "go to", "navigate", "open", "search", "click", "type", "fill",
-    "book", "buy", "purchase", "order", "shop", "shopping",
-    "find", "find me", "show me", "get me", "look for", "look up", "browse",
-    "scroll", "close", "play", "watch", "listen", "pause", "resume",
-    "send", "email", "compose", "post", "tweet", "share", "upload",
-    "compare", "check", "download",
-    "sign in", "log in", "log out", "logout", "sign out",
-    "submit", "add to cart", "checkout",
-    "read", "summarize", "translate",
+    // Navigation / browser actions
+    "go to", "navigate", "open", "search", "click", "type", "fill", "browse",
+    "scroll", "close", "back", "refresh", "reload",
+    // Commerce
+    "book", "buy", "purchase", "order", "shop", "shopping", "checkout", "add to cart",
+    // Creation / generation
+    "create", "make", "build", "generate", "design", "write", "draft", "prepare",
+    "produce", "compose", "develop", "set up", "put together",
+    // Presentation / docs
+    "presentation", "slide", "deck", "ppt", "document", "report", "essay", "summary",
+    // Research / information
+    "research", "find", "find me", "show me", "get me", "look for", "look up",
+    "search for", "tell me about", "what is", "how to", "explain", "analyze",
+    "compare", "check", "summarize", "translate", "read",
+    // Media
+    "play", "watch", "listen", "pause", "resume", "download", "upload",
+    // Communication
+    "send", "email", "message", "post", "tweet", "share",
+    // Auth
+    "sign in", "log in", "log out", "logout", "sign out", "register",
+    // Specific sites (auto-dispatch without LLM)
     "reddit", "twitter", "youtube", "amazon", "flipkart", "instagram", "linkedin",
+    "github", "google", "chatgpt", "perplexity", "gamma", "notion", "figma",
+    // Intent phrases
     "want to", "need to", "help me", "can you", "please", "i'd like", "i would like",
+    "could you", "i need", "i want",
+    // Scheduling / time
     "schedule", "remind", "timer", "alarm", "calendar",
+    // Info lookups
     "weather", "news", "price", "stock", "flight", "hotel", "restaurant"
   ].join("|") + ")\\b",
   "i"
@@ -279,36 +292,8 @@ async function checkAndDispatchIntent(userText) {
     return;
   }
 
-  // Ambiguous — ask llama-4-scout to classify
-  if (!groqApiKey) {
-    // No Groq key: assume actionable rather than silently dropping
-    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-      dispatchTask(userText, tab).catch(e => console.error("BG: dispatchTask error:", e));
-    });
-    return;
-  }
-  try {
-    const raw = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [{
-      role: "system",
-      content: "You classify user speech. Reply ONLY with valid JSON: {\"actionable\": true} or {\"actionable\": false}.\n\nSet actionable=true if the text is asking to do ANYTHING on the web or browser: search, shop, navigate, watch, read, buy, find information, open a site, fill a form, book something, compare prices, check something online, use any website or app. When in doubt, set true."
-    }, {
-      role: "user",
-      content: `User said: "${userText}"`
-    }], { jsonMode: true });
-    const { actionable } = JSON.parse(raw);
-    console.log("BG: Intent check:", userText, "→ actionable:", actionable);
-    if (actionable) {
-      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-        dispatchTask(userText, tab).catch(e => console.error("BG: dispatchTask error:", e));
-      });
-    }
-  } catch (e) {
-    console.warn("BG: Intent check failed:", e.message);
-    // On error: dispatch anyway rather than silently dropping
-    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-      dispatchTask(userText, tab).catch(console.error);
-    });
-  }
+  // No keyword match — treat as ambient conversation, don't dispatch
+  console.log("BG: No task keywords, treating as conversation:", userText.slice(0, 60));
 }
 
 // ---- Offscreen document (mic) ----
@@ -845,32 +830,74 @@ async function callGroq(model, messages, { jsonMode = false } = {}) {
   throw lastErr;
 }
 
-// Free vision-capable models on OpenRouter, ranked by quality.
-// All support image inputs. Fallback chain used when models 404 or 429.
-const VISION_MODELS = [
-  "google/gemma-3-27b-it:free",
-  "mistralai/mistral-small-3.1-24b-instruct:free",
-  "google/gemma-3-12b-it:free",
-  "nvidia/nemotron-nano-12b-v2-vl:free",
-  "google/gemma-3-4b-it:free",
-];
+// ---- Gemini REST Vision ----
+// Uses the existing Gemini API key for vision tasks — free, reliable, excellent at UI screenshots.
+// Converts OpenAI-style messages (with image_url) to Gemini's generateContent format.
+async function callGeminiVision(messages, { jsonMode = false } = {}) {
+  if (!geminiApiKey) throw new Error("Gemini API key not set");
 
-// Tries vision models in order until one succeeds (falls through on 404 and 429)
-async function callOpenRouterVision(messages, opts = {}) {
-  let lastErr;
-  for (const model of VISION_MODELS) {
+  // Build Gemini parts from OpenAI-style messages
+  const geminiContents = [];
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      // Gemini doesn't have system role in basic API — prepend as user text
+      geminiContents.push({ role: "user", parts: [{ text: "[SYSTEM INSTRUCTIONS]\n" + msg.content }] });
+      geminiContents.push({ role: "model", parts: [{ text: "Understood." }] });
+      continue;
+    }
+    const parts = [];
+    const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
+    for (const part of content) {
+      if (part.type === "text") {
+        parts.push({ text: part.text });
+      } else if (part.type === "image_url") {
+        // image_url.url is "data:image/jpeg;base64,<b64>"
+        const dataUrl = part.image_url?.url || "";
+        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+        }
+      }
+    }
+    if (parts.length) geminiContents.push({ role: msg.role === "assistant" ? "model" : "user", parts });
+  }
+
+  const body = {
+    contents: geminiContents,
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 4096,
+      ...(jsonMode ? { responseMimeType: "application/json" } : {})
+    }
+  };
+
+  const model = "gemini-2.5-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
+
+  let lastErr = new Error("Gemini vision: all attempts failed");
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const result = await callOpenRouter(model, messages, opts);
-      console.log("BG: Vision model used:", model);
-      return result;
+      const res = await fetch(url, {
+        method: "POST",
+        signal: AbortSignal.timeout(60000),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (res.status === 429) {
+        lastErr = new Error("Gemini vision: rate limited (429)");
+        await sleep(2000 * Math.pow(2, attempt));
+        continue;
+      }
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Gemini vision ${res.status}: ${err}`);
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.map(p => p.text).join("") || "";
+      return text;
     } catch (e) {
-      console.warn(`BG: Vision model ${model} failed:`, e.message);
       lastErr = e;
-      // Try next model on 404 (not available) or 429 (rate limited)
-      const msg = e.message || "";
-      const shouldFallthrough = msg.includes("404") || msg.includes("429") ||
-        msg.includes("No endpoints") || msg.includes("rate limit") || msg.includes("guardrail");
-      if (!shouldFallthrough) throw e;
+      if (attempt < 2) await sleep(1000);
     }
   }
   throw lastErr;
@@ -979,7 +1006,7 @@ Current URL: ${currentTab?.url || "unknown"}
 Page title: ${currentTab?.title || "unknown"}`;
 
   try {
-    const raw = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [
+    const raw = await callGroq("openai/gpt-oss-20b", [
       { role: "system", content: systemPrompt },
       { role: "user", content: userMsg }
     ], { jsonMode: true });
@@ -1138,12 +1165,12 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       }
     ];
 
-    // Call vision action model via OpenRouter — Gemma 3 27B is the best free vision model
+    // Call vision action model — Gemini 2.0 Flash (free, excellent at UI screenshots)
     console.log("BG: Calling vision model for action decision...");
     broadcastEvent({ type: "THINKING", tabId });
     let response;
     try {
-      response = await callOpenRouterVision([
+      response = await callGeminiVision([
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent }
       ], { jsonMode: true });
@@ -1416,7 +1443,7 @@ ${extractedParts.map((d, i) => `Source ${i + 1} (${parallelSubtasks[i].startUrl}
 
 Write a clear, concise answer comparing the data. Be specific with numbers and names.`;
 
-    const summary = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [
+    const summary = await callGroq("openai/gpt-oss-20b", [
       { role: "user", content: mergePrompt }
     ]);
 
@@ -1438,7 +1465,7 @@ const SCREEN_REF = /\b(on screen|on the screen|this page|current page|what i see
 async function describeCurrentScreen(tabId) {
   try {
     const { data: b64 } = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 70 });
-    const raw = await callOpenRouterVision([{
+    const raw = await callGeminiVision([{
       role: "user",
       content: [
         { type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } },
@@ -1452,6 +1479,20 @@ async function describeCurrentScreen(tabId) {
   }
 }
 
+// ---- Local skill routing (no API call needed) ----
+// Matches intent text to a skill name using keyword rules — same logic as orchestrator
+// but instant and offline. Used as fast-path before / fallback after orchestrator.
+function inferSkillFromIntent(intentText) {
+  const t = intentText.toLowerCase();
+  if (/\b(presentation|slides?|deck|ppt|pitch deck|slideshow|gamma)\b/.test(t)) return "ppt-gamma";
+  if (/\b(research|deep search|look up|find information|learn about|perplexity)\b/.test(t)) return "research-perplexity";
+  if (/\b(compare prices?|cheapest|best price|best deal|how much does|price compare)\b/.test(t)) return "price-compare";
+  if (/\b(summarize (this |the )?video|youtube summary|what is this video|video summary)\b/.test(t)) return "youtube-summarize";
+  if (/\b(design|ui mockup|landing page design|app design|interface design|stitch)\b/.test(t)) return "design-stitch";
+  if (/\b(fill (this |the )?form|apply|sign up|register|checkout form|form fill)\b/.test(t)) return "form-fill";
+  return null;
+}
+
 // ---- Main task dispatcher ----
 async function dispatchTask(intentText, currentTab) {
   console.log("BG: dispatchTask:", intentText, "| tab:", currentTab?.url);
@@ -1460,79 +1501,43 @@ async function dispatchTask(intentText, currentTab) {
 
   broadcastEvent({ type: "TASK_DISPATCHED", intentText });
 
-  // If user references the screen, proactively describe it and reformulate into a concrete goal
+  // Fast-path skill routing — runs before orchestrator so we never block on API failure
+  const fastSkill = inferSkillFromIntent(intentText);
+  if (fastSkill) {
+    console.log("BG: Fast-path skill:", fastSkill, "for:", intentText);
+    const planText = `On it — using ${fastSkill} for: ${intentText}`;
+    broadcastEvent({ type: "PLAN_ANNOUNCED", planText });
+    sendToGeminiLive(`[STATUS: Starting now.]`);
+    await executePlan({ taskType: "simple", skill: fastSkill, steps: [] }, intentText, currentTab);
+    return;
+  }
+
+  // If user references the screen, describe it first and augment the intent
   if (SCREEN_REF.test(intentText) && currentTab?.id) {
-    broadcastEvent({ type: "SCREEN_ANALYZING" });
-    sendToGeminiLive("[STATUS: Let me analyze your screen first...]");
-    const screenDesc = await describeCurrentScreen(currentTab.id);
+    const screenDesc = await describeCurrentScreen(currentTab.id).catch(() => null);
     if (screenDesc) {
-      console.log("BG: Screen described:", screenDesc);
-      broadcastEvent({ type: "SCREEN_ANALYZED", description: screenDesc });
-      // Reformulate the intent into a concrete actionable goal so the agent
-      // doesn't confuse "what's on screen now" with "what to do next"
-      try {
-        const reformulated = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [{
-          role: "system",
-          content: "You rewrite vague user requests that reference 'the screen' into concrete, actionable browser automation goals. Remove all references to 'the screen', 'this', 'what I see' and replace with specific details from the screen context. Output only the rewritten goal, nothing else."
-        }, {
-          role: "user",
-          content: `User request: "${intentText}"\nScreen shows: ${screenDesc}\nCurrent URL: ${currentTab?.url || "unknown"}\n\nRewrite as a concrete goal (e.g. "Go to amazon.com and search for [specific item from screen]"):`
-        }]);
-        if (reformulated?.trim()) {
-          intentText = reformulated.trim();
-          console.log("BG: Reformulated intent:", intentText);
-          broadcastEvent({ type: "INTENT_DETECTED", intentText });
-        }
-      } catch (e) {
-        // Fallback: append context manually
-        intentText = `${intentText} [SCREEN SHOWS: ${screenDesc}]`;
-      }
+      intentText = `${intentText} [SCREEN SHOWS: ${screenDesc}]`;
+      console.log("BG: Augmented intent with screen:", intentText.slice(0, 100));
+      broadcastEvent({ type: "INTENT_DETECTED", intentText });
     }
   }
 
+  // Run orchestrator for routing decisions (best-effort — never blocks execution on failure)
   let decision;
   try {
     decision = await runOrchestrator(intentText, currentTab);
   } catch (e) {
-    broadcastEvent({ type: "TASK_FAILED", error: "Orchestrator error: " + e.message });
-    return;
+    console.warn("BG: Orchestrator failed, using simple fallback:", e.message);
+    decision = { taskType: "simple", skill: null, steps: [] };
   }
 
   if (abortController.signal.aborted) return;
 
-  // Clarification — only when truly needed (orchestrator rule is very strict now)
-  if (decision.clarificationNeeded && decision.clarificationQuestion) {
-    console.log("BG: Clarification needed:", decision.clarificationQuestion);
-    pendingTask = { intentText, decision, tab: currentTab, step: "clarify" };
-    pendingTaskCooldownUntil = Date.now() + 3500; // 3.5s: enough for Gemini to begin speaking the question
-    broadcastEvent({ type: "PLAN_ANNOUNCED", planText: decision.clarificationQuestion });
-    sendToGeminiLive(`[QUESTION: ${decision.clarificationQuestion}]`);
-    return;
-  }
-
-  // Build a rich plan description including steps.
-  const stepList = decision.steps?.length
-    ? decision.steps.join(", then ")
-    : null;
-  const planText = stepList
-    ? `${decision.planSummary || "Here's my plan:"} Steps: ${stepList}.`
-    : (decision.planSummary || "I'll take care of that now.");
-
-  // Only pause and ask "should I go ahead?" for explicitly multi-step or multi-tab tasks.
-  // All other tasks (including skill tasks) announce the plan and execute immediately —
-  // the user hears the plan but doesn't need to confirm for every single action.
-  const needsConfirm = decision.taskType === "multi-step" || decision.taskType === "multi-tab-parallel";
-  if (needsConfirm) {
-    pendingTask = { intentText, decision, tab: currentTab, step: "confirm" };
-    pendingTaskCooldownUntil = Date.now() + 3000;
-    broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
-    sendToGeminiLive(`[PLAN: ${planText}]`);
-    return;
-  }
-
-  // For simple or skill tasks: narrate the plan then execute immediately.
+  // Never ask for confirmation — always execute immediately.
+  // The agent announces the plan via STATUS and gets to work.
+  const planText = decision.planSummary || `Working on: ${intentText}`;
   broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
-  if (planText) sendToGeminiLive(`[STATUS: ${planText}]`);
+  sendToGeminiLive(`[STATUS: ${planText}]`);
   await executePlan(decision, intentText, currentTab);
 }
 
