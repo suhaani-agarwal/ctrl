@@ -1,0 +1,38 @@
+[
+  {
+    "name": "Gamma",
+    "url": "https://gamma.app/create",
+    "bestFor": ["presentations", "slides", "decks", "ppt", "pitch deck", "slideshow"],
+    "skill": "ppt-gamma"
+  },
+  {
+    "name": "Perplexity",
+    "url": "https://perplexity.ai",
+    "bestFor": ["deep research", "fact-finding", "topic comparison", "information lookup", "research"],
+    "skill": "research-perplexity"
+  },
+  {
+    "name": "Google Stitch",
+    "url": "https://stitch.withgoogle.com",
+    "bestFor": ["UI design", "app mockup", "landing page design", "interface design", "design generation"],
+    "skill": "design-stitch"
+  },
+  {
+    "name": "remove.bg",
+    "url": "https://remove.bg",
+    "bestFor": ["background removal", "image cutout", "remove background from image"],
+    "skill": "image-edit"
+  },
+  {
+    "name": "YouTube",
+    "url": "https://youtube.com",
+    "bestFor": ["video summarization", "summarize video", "what is this video about", "video transcript"],
+    "skill": "youtube-summarize"
+  },
+  {
+    "name": "Amazon / Flipkart",
+    "url": "https://amazon.in",
+    "bestFor": ["compare prices", "cheapest price", "best deal", "price check across sites"],
+    "skill": "price-compare"
+  }
+]

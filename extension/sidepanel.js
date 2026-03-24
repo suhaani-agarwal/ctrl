@@ -4,6 +4,7 @@
 // ---- State ----
 let geminiKey = "";
 let groqKey = "";
+let openRouterKey = "";
 let isListening = false;
 let isRecording = false;
 let recordingSteps = [];
@@ -12,44 +13,45 @@ let nextStartTime = 0;
 let currentAgentText = "";
 
 // ---- DOM refs ----
-const micBtn          = document.getElementById("mic-btn");
-const abortBtn        = document.getElementById("abort-btn");
-const statusBadge     = document.getElementById("status-badge");
-const taskCard        = document.getElementById("task-card");
-const taskText        = document.getElementById("task-text");
-const skillBadge      = document.getElementById("skill-badge");
-const stepCounter     = document.getElementById("step-counter");
-const tabBadges       = document.getElementById("tab-badges");
-const transcript      = document.getElementById("transcript");
-const actionLog       = document.getElementById("action-log");
-const settingsBtn     = document.getElementById("settings-btn");
-const settingsDrawer  = document.getElementById("settings-drawer");
-const recordBtn       = document.getElementById("record-btn");
+const micBtn = document.getElementById("mic-btn");
+const abortBtn = document.getElementById("abort-btn");
+const statusBadge = document.getElementById("status-badge");
+const taskCard = document.getElementById("task-card");
+const taskText = document.getElementById("task-text");
+const skillBadge = document.getElementById("skill-badge");
+const stepCounter = document.getElementById("step-counter");
+const tabBadges = document.getElementById("tab-badges");
+const transcript = document.getElementById("transcript");
+const actionLog = document.getElementById("action-log");
+const settingsBtn = document.getElementById("settings-btn");
+const settingsDrawer = document.getElementById("settings-drawer");
+const recordBtn = document.getElementById("record-btn");
 const recordingBanner = document.getElementById("recording-banner");
-const geminiKeyInput  = document.getElementById("gemini-key");
-const groqKeyInput    = document.getElementById("groq-key");
-const permissionMode  = document.getElementById("permission-mode");
-const skillsList      = document.getElementById("skills-list");
-const skillUrlInput   = document.getElementById("skill-url");
+const geminiKeyInput = document.getElementById("gemini-key");
+const groqKeyInput = document.getElementById("groq-key");
+const openRouterKeyInput = document.getElementById("openrouter-key");
+const permissionMode = document.getElementById("permission-mode");
+const skillsList = document.getElementById("skills-list");
+const skillUrlInput = document.getElementById("skill-url");
 const installSkillBtn = document.getElementById("install-skill-btn");
-const installStatus   = document.getElementById("install-status");
-const workflowsList   = document.getElementById("workflows-list");
+const installStatus = document.getElementById("install-status");
+const workflowsList = document.getElementById("workflows-list");
 
 // ---- Init ----
-chrome.storage.local.get(["gemini_key", "groq_key", "permission_mode"], (res) => {
+chrome.storage.local.get(["gemini_key", "groq_key", "openrouter_key", "permission_mode"], (res) => {
   geminiKey = res.gemini_key || "";
   groqKey = res.groq_key || "";
+  openRouterKey = res.openrouter_key || "";
 
   if (geminiKeyInput) geminiKeyInput.value = geminiKey;
   if (groqKeyInput) groqKeyInput.value = groqKey;
+  if (openRouterKeyInput) openRouterKeyInput.value = openRouterKey;
   if (permissionMode && res.permission_mode) permissionMode.value = res.permission_mode;
 
-  // Only send Groq key on init — do NOT auto-connect Gemini (connect only on mic press)
-  if (groqKey) {
-    chrome.runtime.sendMessage({ type: "SET_GROQ_KEY", apiKey: groqKey });
-  }
+  if (groqKey) chrome.runtime.sendMessage({ type: "SET_GROQ_KEY", apiKey: groqKey });
+  if (openRouterKey) chrome.runtime.sendMessage({ type: "SET_OPENROUTER_KEY", apiKey: openRouterKey });
 
-  if (!geminiKey || !groqKey) {
+  if (!geminiKey || !groqKey || !openRouterKey) {
     settingsDrawer.classList.remove("hidden");
   }
 
@@ -72,6 +74,12 @@ groqKeyInput?.addEventListener("change", (e) => {
   groqKey = e.target.value.trim();
   chrome.storage.local.set({ groq_key: groqKey });
   if (groqKey) chrome.runtime.sendMessage({ type: "SET_GROQ_KEY", apiKey: groqKey });
+});
+
+openRouterKeyInput?.addEventListener("change", (e) => {
+  openRouterKey = e.target.value.trim();
+  chrome.storage.local.set({ openrouter_key: openRouterKey });
+  if (openRouterKey) chrome.runtime.sendMessage({ type: "SET_OPENROUTER_KEY", apiKey: openRouterKey });
 });
 
 permissionMode?.addEventListener("change", (e) => {
@@ -100,15 +108,16 @@ micBtn.onclick = async () => {
   if (playbackContext.state === "suspended") await playbackContext.resume();
 
   if (isListening) {
-    // Stop
+    // Stop mic capture — but keep the WebSocket open so Gemini can still speak
+    // (narrate task results, etc.). The WebSocket is a fresh session on next mic-on.
     isListening = false;
     micBtn.classList.remove("mic-on", "mic-listening");
     micBtn.classList.add("mic-off");
     setStatus("idle");
     await msgBg({ type: "STOP_MIC" });
-    await msgBg({ type: "DISCONNECT_WEBSOCKET" });
+    // Do NOT disconnect WebSocket here — Gemini needs it to narrate task updates.
   } else {
-    // Start
+    // Start — always create a FRESH Gemini session (clears history → fast responses).
     if (!geminiKey || !groqKey) {
       settingsDrawer.classList.remove("hidden");
       appendTranscript("agent", "Please set both your Gemini and Groq API keys first.");
@@ -118,6 +127,8 @@ micBtn.onclick = async () => {
     micBtn.classList.remove("mic-off");
     micBtn.classList.add("mic-on");
     setStatus("listening");
+    // Disconnect any existing session first, then create a fresh one.
+    await msgBg({ type: "DISCONNECT_WEBSOCKET" });
     await msgBg({ type: "CONNECT_WEBSOCKET", apiKey: geminiKey });
     await msgBg({ type: "START_MIC" });
   }
@@ -161,7 +172,7 @@ function stopRecording() {
 chrome.runtime.onMessage.addListener((message) => {
   // Raw Gemini Live messages (audio + text)
   if (message.type === "SERVER_MESSAGE") {
-    try { handleGeminiServerMessage(JSON.parse(message.data)); } catch {}
+    try { handleGeminiServerMessage(JSON.parse(message.data)); } catch { }
     return;
   }
 
@@ -247,6 +258,16 @@ function handleAgentEvent(event) {
       abortBtn.classList.remove("hidden");
       break;
 
+    case "SCREEN_ANALYZING":
+      setStatus("thinking");
+      appendLog("📸", "Analyzing screen...", "thinking");
+      break;
+
+    case "SCREEN_ANALYZED":
+      appendLog("📸", `Screen: ${event.description}`, "");
+      appendTranscript("agent", `👁 ${event.description}`);
+      break;
+
     case "PLAN_ANNOUNCED":
       setStatus("listening");
       if (event.steps?.length) {
@@ -281,8 +302,7 @@ function handleAgentEvent(event) {
 
     case "THOUGHT":
       if (event.thought) {
-        appendTranscript("thought", `💭 ${event.thought}`);
-        // If recording, add thought to steps for context
+        appendLog("💭", event.thought.slice(0, 120), "thinking");
       }
       break;
 
@@ -498,14 +518,15 @@ function actionIcon(type) {
 function describeAction(action, elementName) {
   if (!action) return "unknown action";
   switch (action.type) {
-    case "click":   return `Click "${elementName || `element ${action.elementIndex}`}"`;
-    case "type":    return `Type "${action.value?.slice(0, 40)}" into "${elementName || `element ${action.elementIndex}`}"`;
-    case "scroll":  return `Scroll ${action.direction || "down"} ${action.amount || 400}px`;
+    case "click": return `Click "${elementName || `element ${action.elementIndex}`}"`;
+    case "type": return `Type "${action.value?.slice(0, 40)}" into "${elementName || `element ${action.elementIndex}`}"`;
+    case "scroll": return `Scroll ${action.direction || "down"} ${action.amount || 400}px`;
     case "navigate": return `Navigate to ${action.url}`;
     case "keypress": return `Press ${action.key}`;
-    case "select":  return `Select "${action.value}" in element ${action.elementIndex}`;
+    case "select": return `Select "${action.value}" in element ${action.elementIndex}`;
     case "extract": return `Extract: ${Object.keys(action.fields || {}).join(", ")}`;
-    case "wait":    return `Wait ${action.ms}ms`;
+    case "wait": return `Wait ${action.ms}ms`;
+    case "dismiss_popup": return "Dismiss popup / press Escape";
     default: return action.type;
   }
 }

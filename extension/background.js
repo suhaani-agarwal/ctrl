@@ -1,24 +1,29 @@
 // background.js — Service worker. Central hub for all agent logic.
 // Imports skills registry (module type declared in manifest).
 import { initSkillRegistry, getAllSkills, getSkill, getSkillManifest } from "./skills/index.js";
+import { getUserProfile, formatProfileForAgent } from "./storage/user-profile.js";
 
 // ---- Constants ----
-const MAX_ROUNDS = 15;
+const MAX_ROUNDS = 25; // default; skills can override with maxRounds
 const SETTLE_MS = 150;
 const NAVIGATE_SETTLE_MS = 1200;
-const SENSITIVE_ACTIONS = new Set(["type"]);
+const SENSITIVE_ACTIONS = new Set([]);
 const GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions";
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1/chat/completions";
 
 // ---- State ----
 let geminiSocket = null;
 let geminiApiKey = null;
 let groqApiKey = null;
+let openRouterApiKey = null;
 let intentionalClose = false;
 let reconnectCount = 0;
 const MAX_RECONNECTS = 3;
 let nativePort = null;
 let abortController = null; // abort current task loop
 let pendingTask = null;     // { intentText, decision, tab, step: "clarify"|"confirm" }
+let isTaskRunning = false;  // blocks ambient speech from aborting an in-progress task
+let pendingTaskCooldownUntil = 0; // ignore mic input for N ms after asking a question (prevents Gemini audio feedback)
 
 // CDP: tabId → { attached: boolean }
 const cdpSessions = new Map();
@@ -35,9 +40,10 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => 
 // Load skills and restore API keys on startup (service workers restart frequently)
 async function onStartup() {
   await initSkillRegistry().catch(console.error);
-  const { groq_key, gemini_key } = await chrome.storage.local.get(["groq_key", "gemini_key"]);
+  const { groq_key, gemini_key, openrouter_key } = await chrome.storage.local.get(["groq_key", "gemini_key", "openrouter_key"]);
   if (groq_key) { groqApiKey = groq_key; console.log("BG: Groq key restored from storage"); }
   if (gemini_key) { geminiApiKey = gemini_key; console.log("BG: Gemini key restored from storage"); }
+  if (openrouter_key) { openRouterApiKey = openrouter_key; console.log("BG: OpenRouter key restored from storage"); }
 }
 onStartup();
 
@@ -54,6 +60,8 @@ function broadcastRaw(msg) {
 function connectGeminiLive(gKey) {
   if (!gKey) return;
   geminiApiKey = gKey;
+  intentionalClose = false; // reset so auto-reconnect works for this new session
+  reconnectCount = 0;
   if (geminiSocket) { geminiSocket.onclose = null; geminiSocket.close(); }
 
   const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${geminiApiKey}`;
@@ -74,26 +82,25 @@ function connectGeminiLive(gKey) {
         system_instruction: {
           parts: [{
             text:
-              "You are ctrl, a voice interface for browser automation.\n\n" +
-              "RULE 1 — Browser tasks (navigate, click, search, fill, book, buy, compare, scroll, play, open, etc.):\n" +
-              "  a) Say a VERY short acknowledgement: 'Sure!', 'On it!', 'Got it.', 'Searching!' (3-5 words max)\n" +
-              "  b) On the next line output EXACTLY: [INTENT: plain description of what to do]\n" +
-              "  Example: user says 'fill out this form' → speak 'On it!' then output [INTENT: fill out the form on the current page]\n" +
-              "  Example: user says 'go to youtube' → speak 'Sure!' then output [INTENT: navigate to https://youtube.com]\n" +
-              "  Example: user says 'compare prices on amazon and flipkart' → speak 'Got it!' then output [INTENT: compare prices on Amazon and Flipkart]\n\n" +
-              "RULE 2 — Pure conversation (greetings, jokes, questions about you, weather, trivia):\n" +
-              "  Just respond naturally. Do NOT output [INTENT: ...] for these.\n\n" +
-              "RULE 3 — When you receive [TASK_DONE: result]:\n" +
-              "  Speak the result in 1 natural sentence. No JSON, no lists.\n\n" +
-              "RULE 4 — When you receive [TASK_FAILED: reason]:\n" +
-              "  Apologize in 1 sentence and mention the reason.\n\n" +
-              "RULE 5 — When you receive [PLAN: text]:\n" +
-              "  Read the plan out loud naturally, then ask 'Should I go ahead?' Do not add [INTENT:] here.\n\n" +
-              "RULE 6 — When you receive [QUESTION: text]:\n" +
-              "  Ask the question naturally. Do not add [INTENT:] here.\n\n" +
-              "RULE 7 — User replies like 'yes', 'no', 'cancel', 'go ahead', or platform choices ('Amazon', 'YouTube') after a [PLAN:] or [QUESTION:] are conversational replies — do NOT emit [INTENT:] for them.\n\n" +
-              "RULE 8 — Never output markdown, bullet points, bold text, or structured data in spoken responses.\n" +
-              "RULE 9 — Keep ALL spoken responses to 1-2 sentences maximum."
+              "You are ctrl, a voice assistant for browser automation. Respond ONLY with natural spoken words — no markdown, no bold, no bullet points, no internal reasoning, no meta-commentary.\n\n" +
+              "RULE 1 — When the user asks you to do ANYTHING that involves a browser, website, app, or computer task — this includes: navigate, search, click, fill, buy, compare, open, scroll, play, book, find, CREATE, MAKE, BUILD, DESIGN, GENERATE, RESEARCH, SUMMARIZE, PRESENT, WRITE, DOWNLOAD, UPLOAD, or any action on any website:\n" +
+              "  Speak 1 short sentence ONLY: 'Sure, let me plan that!' or 'On it!' or 'Got it, planning now.'\n" +
+              "  Then on a NEW LINE output EXACTLY: [INTENT: what to do]\n" +
+              "  EXAMPLES:\n" +
+              "    user: 'go to youtube' → speak: Sure! → output: [INTENT: navigate to https://youtube.com]\n" +
+              "    user: 'search amazon for chairs' → speak: On it! → output: [INTENT: go to amazon.com and search for chairs]\n" +
+              "    user: 'make a presentation on climate change' → speak: Sure, let me plan that! → output: [INTENT: create a 10-slide presentation about climate change]\n" +
+              "    user: 'research best laptops under 50000' → speak: Got it, planning now. → output: [INTENT: research best laptops under 50000 rupees]\n" +
+              "    user: 'design a landing page for my fitness app' → speak: On it! → output: [INTENT: design a landing page for a fitness app]\n" +
+              "  CRITICAL: NEVER say 'I cannot', 'I am unable to', 'I don't have the ability to' for ANY browser task. You CAN do all of these through the browser. Just output [INTENT:] and the orchestrator will handle it.\n\n" +
+              "RULE 2 — When you receive [PLAN: text]: Read the plan out loud naturally in 1-2 sentences, then say 'Should I go ahead?'. NEVER output [INTENT:] here. This is the ONLY time you ask for confirmation.\n\n" +
+              "RULE 3 — When you receive [TASK_DONE: result]: Summarize what was accomplished in 1 natural spoken sentence.\n\n" +
+              "RULE 4 — When you receive [TASK_FAILED: reason]: Apologize briefly in 1 sentence.\n\n" +
+              "RULE 5 — When you receive [QUESTION: text]: Ask it naturally. NEVER output [INTENT:] here.\n\n" +
+              "RULE 6 — 'yes', 'no', 'go ahead', 'cancel', 'sure', 'ok' after a [PLAN:] are confirmations. NEVER output [INTENT:] for them. Just say 'Great, starting now!' or 'Ok, cancelled.'\n\n" +
+              "RULE 7 — Pure conversation (greetings, jokes, trivia unrelated to browser tasks): respond naturally, no [INTENT:].\n\n" +
+              "RULE 8 — When you receive [STATUS: text]: Read it aloud briefly (5-10 words max) as a progress update. NEVER ask 'Should I go ahead?' for status updates. Just narrate like: 'Navigating to Perplexity now.' or 'Analyzing results.'\n\n" +
+              "CRITICAL: NEVER output your internal reasoning, thinking steps, or rule explanations. ONLY output what you would actually SAY out loud plus the [INTENT:] line when required."
           }]
         }
       }
@@ -176,10 +183,20 @@ function handleGeminiLiveMessage(rawText) {
     }
 
     // If waiting for user reply to a plan/clarification, route there first
+    // BUT skip if still in cooldown period (Gemini's own audio being picked up by mic)
     if (pendingTask && userTranscript) {
       const cleanForPending = userTranscript.replace(/[^\x00-\x7F\u00C0-\u024F\u1E00-\u1EFF]/g, "").replace(/\s+/g, " ").trim() || userTranscript;
-      console.log("BG: Routing to pending task handler:", cleanForPending.slice(0, 80));
-      handlePendingTaskResponse(cleanForPending);
+      const isConfirmWord = /^\s*(yes|yeah|yep|yup|sure|ok|okay|go|no|nope|cancel|stop)\s*[.!]?\s*$/i.test(cleanForPending);
+      const cooldownPassed = Date.now() > pendingTaskCooldownUntil;
+      // Bypass cooldown for obvious yes/no words — they can't be Gemini's own audio
+      if (cleanForPending.split(/\s+/).length < 1) {
+        console.log("BG: Ignoring too-short pending response:", cleanForPending);
+      } else if (cooldownPassed || isConfirmWord) {
+        console.log("BG: Routing to pending task handler:", cleanForPending.slice(0, 80));
+        handlePendingTaskResponse(cleanForPending);
+      } else {
+        console.log("BG: Pending response in cooldown, ignoring:", cleanForPending.slice(0, 40));
+      }
       if (fullText.includes("[RECORD_START]")) broadcastRaw({ type: "RECORD_START" });
       if (fullText.includes("[RECORD_STOP]")) broadcastRaw({ type: "RECORD_STOP" });
       return;
@@ -189,11 +206,22 @@ function handleGeminiLiveMessage(rawText) {
     const intentMatch = fullText.match(/\[INTENT:\s*([\s\S]+?)(?:\]|$)/);
     if (intentMatch) {
       const intentText = intentMatch[1].trim().replace(/\]$/, "");
-      console.log("BG: [INTENT] detected:", intentText);
-      broadcastRaw({ type: "INTENT_DETECTED", intentText });
-      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-        dispatchTask(intentText, tab).catch(e => console.error("BG: dispatchTask error:", e));
-      });
+      // Discard garbage/meta-commentary that Gemini sometimes emits instead of a real intent
+      const isGarbage = intentText.length < 5
+        || intentText.startsWith("]")
+        || /output is needed|move forward naturally|conversation flow|per the rules|naturally with|fluidly/i.test(intentText);
+      if (isGarbage) {
+        console.log("BG: Discarding garbage [INTENT]:", intentText.slice(0, 80));
+      } else if (isTaskRunning || pendingTask) {
+        // Never let Gemini's echo fire a second dispatch while a task is running/pending
+        console.log("BG: [INTENT] blocked — task running or pending confirmation:", intentText.slice(0, 60));
+      } else {
+        console.log("BG: [INTENT] detected:", intentText);
+        broadcastRaw({ type: "INTENT_DETECTED", intentText });
+        chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+          dispatchTask(intentText, tab).catch(e => console.error("BG: dispatchTask error:", e));
+        });
+      }
     } else if (userTranscript) {
       // Strip non-Latin script characters (Hindi, Arabic, CJK etc.) — transcription artifacts
       // when Gemini mishears audio. Keep ASCII + extended Latin (accented chars like é, ñ).
@@ -233,6 +261,12 @@ const TASK_KEYWORDS = new RegExp(
 );
 
 async function checkAndDispatchIntent(userText) {
+  // Don't interrupt a running task or pending confirmation with ambient audio/noise
+  if (isTaskRunning || pendingTask) {
+    console.log("BG: Task running/pending, ignoring ambient speech:", userText.slice(0, 60));
+    return;
+  }
+
   // Always broadcast so sidepanel can show the user transcript
   broadcastRaw({ type: "INTENT_DETECTED", intentText: userText });
 
@@ -254,7 +288,7 @@ async function checkAndDispatchIntent(userText) {
     return;
   }
   try {
-    const raw = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [{
+    const raw = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [{
       role: "system",
       content: "You classify user speech. Reply ONLY with valid JSON: {\"actionable\": true} or {\"actionable\": false}.\n\nSet actionable=true if the text is asking to do ANYTHING on the web or browser: search, shop, navigate, watch, read, buy, find information, open a site, fill a form, book something, compare prices, check something online, use any website or app. When in doubt, set true."
     }, {
@@ -346,12 +380,22 @@ const ROLE_COLORS = {
 };
 
 async function buildAnnotatedScreenshot(tabId) {
-  // 1. Raw screenshot
+  // 1. Get CSS viewport dimensions + devicePixelRatio so canvas coordinates match CDP mouse events
+  let vpW = 1280, vpH = 800, dpr = 1;
+  try {
+    const { result: vp } = await cdp(tabId, "Runtime.evaluate", {
+      expression: "JSON.stringify([window.innerWidth,window.innerHeight,window.devicePixelRatio])",
+      returnByValue: true
+    });
+    [vpW, vpH, dpr] = JSON.parse(vp.value);
+  } catch { }
+
+  // 2. Raw screenshot
   const { data: screenshotB64 } = await cdp(tabId, "Page.captureScreenshot", {
     format: "jpeg", quality: 75
   });
 
-  // 2. Accessibility tree
+  // 3. Accessibility tree — primary source
   let interactiveNodes = [];
   try {
     const { nodes } = await cdp(tabId, "Accessibility.getFullAXTree");
@@ -362,7 +406,7 @@ async function buildAnnotatedScreenshot(tabId) {
     console.warn("BG: AXTree failed", e);
   }
 
-  // 3. Bounding boxes — fetch in parallel (much faster than sequential)
+  // 4a. Bounding boxes from AX tree
   const capped = interactiveNodes.slice(0, 60);
   const boxResults = await Promise.all(capped.map(async (node) => {
     try {
@@ -372,18 +416,21 @@ async function buildAnnotatedScreenshot(tabId) {
   }));
 
   const elements = [];
+  const seenBackendIds = new Set();
+
   for (const res of boxResults) {
     if (!res) continue;
     const { node, model } = res;
-    const border = model.border; // [x1,y1, x2,y2, x3,y3, x4,y4]
+    const border = model.border;
     const xs = [border[0], border[2], border[4], border[6]];
     const ys = [border[1], border[3], border[5], border[7]];
     const x = Math.min(...xs);
     const y = Math.min(...ys);
     const w = Math.max(...xs) - x;
     const h = Math.max(...ys) - y;
-    if (w > 2 && h > 2) {
+    if (w > 2 && h > 2 && x < vpW && y < vpH && x + w > 0 && y + h > 0) {
       const name = node.name?.value || node.description?.value || "";
+      seenBackendIds.add(node.backendDOMNodeId);
       elements.push({
         index: elements.length + 1,
         backendNodeId: node.backendDOMNodeId,
@@ -395,110 +442,281 @@ async function buildAnnotatedScreenshot(tabId) {
     }
   }
 
-  // 4. Annotate with OffscreenCanvas
-  let annotatedB64 = screenshotB64; // fallback: unannotated
+  // 4b. DOM fallback — catches React/SPA elements the AX tree misses.
+  // Uses a single JS evaluation to collect all interactive elements with their rect + backendNodeId.
+  // This is critical for SPAs like Gamma where the AX tree is nearly empty.
   try {
-    // const bytes = Uint8Array.from(atob(screenshotB64), c => c.charCodeAt(0));
-    const blob = new Blob([bytes], { type: "image/jpeg" });
+    // Step 1: collect rects + labels in one JS call and tag each element with a temp index
+    const { result: tagRes } = await cdp(tabId, "Runtime.evaluate", {
+      expression: `(function() {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const SELECTORS = 'button:not([disabled]),[role="button"],[role="tab"],[role="menuitem"],[role="option"],input:not([type="hidden"]):not([disabled]),textarea:not([disabled]),[contenteditable="true"],[contenteditable=""],a[href],select:not([disabled]),[role="textbox"],[role="searchbox"],[role="combobox"]';
+        const seen = new Set();
+        const out = [];
+        let i = 0;
+        try {
+          for (const el of document.querySelectorAll(SELECTORS)) {
+            if (seen.has(el)) continue; seen.add(el);
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) continue;
+            if (r.right < 0 || r.bottom < 0 || r.left > vw || r.top > vh) continue;
+            const tag = 'ctrldom' + (i++);
+            el.dataset.ctrlTag = tag;
+            const role = el.getAttribute('role') || (el.tagName==='BUTTON'?'button':el.tagName==='A'?'link':el.tagName==='INPUT'?(el.type==='checkbox'?'checkbox':el.type==='radio'?'radio':'textbox'):el.tagName==='TEXTAREA'?'textbox':el.tagName==='SELECT'?'combobox':el.hasAttribute('contenteditable')?'textbox':'button');
+            const name = (el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.getAttribute('title')||el.textContent?.trim()||el.tagName.toLowerCase()).slice(0,80);
+            out.push({ tag, role, name, x:Math.round(r.left), y:Math.round(r.top), w:Math.round(r.width), h:Math.round(r.height) });
+          }
+        } catch(e){}
+        return JSON.stringify(out);
+      })()`,
+      returnByValue: true
+    });
+
+    const domItems = JSON.parse(tagRes.value || "[]");
+
+    if (domItems.length > 0) {
+      // Step 2: get document root once, then resolve each tag to backendNodeId via DOM.querySelector
+      const { root } = await cdp(tabId, "DOM.getDocument", { depth: 0 });
+      const rootNodeId = root.nodeId;
+
+      // Resolve in batches (parallel per item is fine, CDP handles it)
+      const resolveResults = await Promise.all(domItems.map(async (item) => {
+        try {
+          const { nodeId } = await cdp(tabId, "DOM.querySelector", {
+            nodeId: rootNodeId,
+            selector: `[data-ctrl-tag="${item.tag}"]`
+          });
+          if (!nodeId) return null;
+          const { node } = await cdp(tabId, "DOM.describeNode", { nodeId, depth: 0 });
+          return { item, backendNodeId: node.backendNodeId };
+        } catch { return null; }
+      }));
+
+      for (const res of resolveResults) {
+        if (!res) continue;
+        const { item, backendNodeId } = res;
+        if (!backendNodeId || seenBackendIds.has(backendNodeId)) continue;
+        seenBackendIds.add(backendNodeId);
+        elements.push({
+          index: elements.length + 1,
+          backendNodeId,
+          role: item.role,
+          name: item.name,
+          x: item.x, y: item.y, w: item.w, h: item.h
+        });
+      }
+
+      // Cleanup temp data attributes
+      await cdp(tabId, "Runtime.evaluate", {
+        expression: `document.querySelectorAll('[data-ctrl-tag]').forEach(e=>delete e.dataset.ctrlTag)`,
+        returnByValue: false
+      }).catch(() => {});
+    }
+  } catch (e) {
+    console.warn("BG: DOM fallback failed:", e.message);
+  }
+
+  // 5. Annotate — draw screenshot scaled to CSS viewport (so annotation coords align with CDP)
+  let annotatedB64 = screenshotB64;
+  try {
+    const screenshotBytes = Uint8Array.from(atob(screenshotB64), c => c.charCodeAt(0));
+    const blob = new Blob([screenshotBytes], { type: "image/jpeg" });
     const img = await createImageBitmap(blob);
 
-    const canvas = new OffscreenCanvas(img.width, img.height);
+    // Canvas is in CSS pixel space — scale screenshot down if dpr > 1
+    const canvas = new OffscreenCanvas(vpW, vpH);
     const ctx = canvas.getContext("2d");
-    ctx.drawImage(img, 0, 0);
+    ctx.drawImage(img, 0, 0, vpW, vpH); // scales physical pixels → CSS pixels
 
     for (const el of elements) {
       const [r, g, b] = ROLE_COLORS[el.role] || ROLE_COLORS.default;
-      ctx.fillStyle = `rgba(${r},${g},${b},0.35)`;
+      ctx.fillStyle = `rgba(${r},${g},${b},0.25)`;
       ctx.fillRect(el.x, el.y, el.w, el.h);
-      ctx.strokeStyle = `rgba(${r},${g},${b},0.9)`;
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = `rgba(${r},${g},${b},1)`;
+      ctx.lineWidth = 1.5;
       ctx.strokeRect(el.x, el.y, el.w, el.h);
 
-      // Number label background
-      const labelW = el.index >= 10 ? 26 : 20;
-      ctx.fillStyle = `rgba(${r},${g},${b},0.95)`;
-      ctx.fillRect(el.x, el.y, labelW, 18);
+      // Number label at top-left of element
+      const label = String(el.index);
+      const labelW = label.length > 1 ? 22 : 16;
+      ctx.fillStyle = `rgba(${r},${g},${b},1)`;
+      ctx.fillRect(el.x, el.y, labelW, 16);
       ctx.fillStyle = "#fff";
-      ctx.font = "bold 11px monospace";
-      ctx.fillText(String(el.index), el.x + 3, el.y + 13);
+      ctx.font = "bold 10px monospace";
+      ctx.fillText(label, el.x + 2, el.y + 11);
     }
 
-    const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.8 });
+    const outBlob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.85 });
     const arrBuf = await outBlob.arrayBuffer();
-    const bytes = new Uint8Array(arrBuf);
+    const outBytes = new Uint8Array(arrBuf);
     let binary = "";
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < outBytes.length; i++) binary += String.fromCharCode(outBytes[i]);
     annotatedB64 = btoa(binary);
   } catch (e) {
     console.warn("BG: annotation failed, using raw screenshot", e);
   }
 
-  // 5. Build numbered element list text
+  // 6. Build element list — index is what the model uses in actions; coords are reference only
   const elementList = elements.map(el => {
     const roleLabel = el.role.charAt(0).toUpperCase() + el.role.slice(1);
-    return `${el.index}. ${roleLabel} "${el.name || "(no label)"}"`;
-  }).join("\n") || "(no interactive elements detected)";
+    const cx = Math.round(el.x + el.w / 2);
+    const cy = Math.round(el.y + el.h / 2);
+    return `[${el.index}] ${roleLabel} "${el.name || "(no label)"}" (x:${cx} y:${cy})`;
+  }).join("\n") || "(no interactive elements visible in viewport)";
 
-  // 6. Store element map for this tab
+  // 7. Store element map (kept for backward compat but coords are now primary)
   const elementMap = new Map(elements.map(el => [el.index, el]));
   elementMaps.set(tabId, elementMap);
 
-  return { annotatedB64, elementList, elementMap };
+  return { annotatedB64, elementList, elementMap, vpW, vpH };
 }
 
 // ---- CDP Action Execution ----
-async function executeCdpAction(tabId, action, elementMap) {
-  const el = action.elementIndex ? elementMap.get(action.elementIndex) : null;
+// Click at raw CSS pixel coordinates (used by scroll, dismiss_popup, legacy paths)
+async function cdpClick(tabId, x, y) {
+  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  await sleep(60);
+  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", x, y, clickCount: 1 });
+  await sleep(30);
+  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", x, y, clickCount: 1 });
+}
 
+// Click by backendNodeId — scroll into view first, then re-derive coordinates.
+// Much more reliable than coordinate-based clicks on SPAs after scroll/reflow.
+async function cdpClickElement(tabId, backendNodeId) {
+  // Scroll the element into the center of the viewport
+  const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId });
+  await cdp(tabId, "Runtime.callFunctionOn", {
+    objectId: object.objectId,
+    functionDeclaration: "function() { this.scrollIntoView({ block: 'center', inline: 'nearest' }); }",
+    silent: true
+  });
+  await sleep(150); // allow reflow
+
+  // Get fresh bounding box AFTER scroll
+  const { model } = await cdp(tabId, "DOM.getBoxModel", { backendNodeId });
+  const b = model.border;
+  const x = Math.round((b[0] + b[2] + b[4] + b[6]) / 4);
+  const y = Math.round((b[1] + b[3] + b[5] + b[7]) / 4);
+  await cdpClick(tabId, x, y);
+  return { x, y };
+}
+
+// JS-level click fallback — triggers React/SPA synthetic event system.
+// Only used when CDP mouse events have no visible effect (detected post-click).
+async function jsClickElement(tabId, backendNodeId) {
+  const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId });
+  await cdp(tabId, "Runtime.callFunctionOn", {
+    objectId: object.objectId,
+    functionDeclaration: `function() {
+      this.scrollIntoView({ block: 'center', inline: 'nearest' });
+      if (this.focus) this.focus();
+      this.click();
+      this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      this.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+      this.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true }));
+    }`,
+    silent: true
+  });
+}
+
+async function executeCdpAction(tabId, action, elementMap) {
   switch (action.type) {
+
     case "click": {
-      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
-      const cx = el.x + el.w / 2;
-      const cy = el.y + el.h / 2;
-      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
-      await sleep(80);
-      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", x: cx, y: cy, clickCount: 1 });
-      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", x: cx, y: cy, clickCount: 1 });
-      break;
+      // Preferred: index-based — scroll into view + fresh coordinates (most reliable)
+      let clickIdx = action.index ?? action.elementIndex;
+      // Elements are 1-based; model sometimes returns 0 meaning "first element"
+      if (clickIdx === 0) clickIdx = 1;
+      if (clickIdx != null) {
+        const el = elementMap.get(Number(clickIdx));
+        if (!el?.backendNodeId) throw new Error(`Element [${clickIdx}] not in map — use an index shown in the CLICKABLE ELEMENTS list (1-based)`);
+        await cdpClickElement(tabId, el.backendNodeId);
+        break;
+      }
+      // Coordinate fallback (legacy / navigate-bar avoidance)
+      if (action.x != null && action.y != null) {
+        await cdpClick(tabId, action.x, action.y);
+        break;
+      }
+      throw new Error("click action missing index and x,y");
     }
 
     case "type": {
-      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
-      // Focus element
-      await cdp(tabId, "DOM.focus", { backendNodeId: el.backendNodeId });
-      if (action.clear) {
-        // Select all + delete
-        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 8 });
-        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 8 });
-        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace" });
-        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Backspace", code: "Backspace" });
+      // Preferred: index-based focus
+      const typeIdx = action.index ?? action.elementIndex;
+      if (typeIdx != null) {
+        const el = elementMap.get(Number(typeIdx));
+        if (!el?.backendNodeId) throw new Error(`Element [${typeIdx}] not in map`);
+        // Scroll into view + coordinate click (activates the element in the browser)
+        await cdpClickElement(tabId, el.backendNodeId);
+        await sleep(80);
+        // Also use DOM.focus to ensure the element is keyboard-focused
+        try { await cdp(tabId, "DOM.focus", { backendNodeId: el.backendNodeId }); } catch {}
+      } else if (action.x != null && action.y != null) {
+        await cdpClick(tabId, action.x, action.y);
+      } else {
+        throw new Error("type action missing index and x,y");
       }
-      // Try insertText first (fast path for plain inputs)
+      await sleep(120);
+
+      // Select-all + delete to clear if requested
+      if (action.clear) {
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 8 });
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp",   key: "a", code: "KeyA", modifiers: 8 });
+        await sleep(30);
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Backspace", code: "Backspace" });
+        await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp",   key: "Backspace", code: "Backspace" });
+        await sleep(30);
+      }
+
+      // insertText is fastest; fall back to char-by-char for React/Vue controlled inputs
       try {
         await cdp(tabId, "Input.insertText", { text: action.value });
       } catch {
-        // Fallback: character-by-character (React/Vue controlled inputs)
         for (const char of action.value) {
-          await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: char, text: char });
           await cdp(tabId, "Input.dispatchKeyEvent", { type: "char", key: char, text: char });
-          await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: char, text: char });
+          await sleep(8);
         }
       }
+      await sleep(50);
+
+      // Fire React/Vue synthetic events so controlled inputs pick up the new value.
+      // For regular <input>/<textarea>: use nativeInputValueSetter to bypass React's read-only value.
+      // For contenteditable divs (Perplexity, Notion, etc.): dispatch input event directly.
+      try {
+        const el = elementMap.get(Number(action.index ?? action.elementIndex));
+        if (el?.backendNodeId) {
+          const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: el.backendNodeId });
+          await cdp(tabId, "Runtime.callFunctionOn", {
+            objectId: object.objectId,
+            functionDeclaration: `function(val) {
+              // React controlled input: override via native setter
+              const inputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement?.prototype, 'value')?.set;
+              const textareaSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement?.prototype, 'value')?.set;
+              const setter = this.tagName === 'TEXTAREA' ? textareaSetter : inputSetter;
+              if (setter) setter.call(this, val);
+              // Fire events React listens to
+              this.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+              this.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            }`,
+            arguments: [{ value: action.value }],
+            silent: true
+          });
+        }
+      } catch { /* non-critical */ }
       break;
     }
 
     case "scroll": {
       const amount = action.amount || 400;
       const deltaY = action.direction === "up" ? -amount : amount;
-      // Scroll at center of viewport
       const { result } = await cdp(tabId, "Runtime.evaluate", {
-        expression: `[window.innerWidth / 2, window.innerHeight / 2]`,
+        expression: "[window.innerWidth/2, window.innerHeight/2]",
         returnByValue: true
       });
       const [cx, cy] = result.value;
-      await cdp(tabId, "Input.dispatchMouseEvent", {
-        type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY
-      });
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY });
       break;
     }
 
@@ -508,26 +726,28 @@ async function executeCdpAction(tabId, action, elementMap) {
     }
 
     case "keypress": {
-      const target = el;
-      if (target) {
-        await cdp(tabId, "DOM.focus", { backendNodeId: target.backendNodeId });
-      }
-      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: action.key, code: action.key });
-      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: action.key, code: action.key });
+      const KEY_CODES = {
+        Enter:      { code: "Enter",      windowsVirtualKeyCode: 13 },
+        Tab:        { code: "Tab",        windowsVirtualKeyCode: 9  },
+        Escape:     { code: "Escape",     windowsVirtualKeyCode: 27 },
+        ArrowDown:  { code: "ArrowDown",  windowsVirtualKeyCode: 40 },
+        ArrowUp:    { code: "ArrowUp",    windowsVirtualKeyCode: 38 },
+        ArrowLeft:  { code: "ArrowLeft",  windowsVirtualKeyCode: 37 },
+        ArrowRight: { code: "ArrowRight", windowsVirtualKeyCode: 39 },
+        Backspace:  { code: "Backspace",  windowsVirtualKeyCode: 8  },
+      };
+      const keyInfo = KEY_CODES[action.key] || { code: action.key, windowsVirtualKeyCode: 0 };
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: action.key, ...keyInfo });
+      await sleep(30);
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp",   key: action.key, ...keyInfo });
       break;
     }
 
-    case "select": {
-      if (!el) throw new Error(`Element ${action.elementIndex} not in map`);
-      // Use Runtime to set native select value
-      const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: el.backendNodeId });
-      if (object?.objectId) {
-        await cdp(tabId, "Runtime.callFunctionOn", {
-          functionDeclaration: `function(v) { this.value = v; this.dispatchEvent(new Event('change', {bubbles:true})); this.dispatchEvent(new Event('input', {bubbles:true})); }`,
-          objectId: object.objectId,
-          arguments: [{ value: action.value }]
-        });
-      }
+    case "dismiss_popup": {
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp",   key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+      await sleep(200);
+      await cdpClick(tabId, 10, 10).catch(() => {});
       break;
     }
 
@@ -537,7 +757,7 @@ async function executeCdpAction(tabId, action, elementMap) {
     }
 
     case "extract": {
-      // No-op: model reads data from AXTree via its own vision; extractedData returned in response
+      // No-op: model reads extracted data from the screenshot
       break;
     }
 
@@ -591,11 +811,12 @@ async function callGroq(model, messages, { jsonMode = false } = {}) {
   };
   if (jsonMode) body.response_format = { type: "json_object" };
 
-  let lastErr;
+  let lastErr = new Error("Groq: all attempts failed");
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(GROQ_BASE, {
         method: "POST",
+        signal: AbortSignal.timeout(45000),
         headers: {
           "Authorization": `Bearer ${groqApiKey}`,
           "Content-Type": "application/json"
@@ -604,13 +825,92 @@ async function callGroq(model, messages, { jsonMode = false } = {}) {
       });
 
       if (res.status === 429) {
-        await sleep(1000 * Math.pow(2, attempt));
+        lastErr = new Error("Groq: rate limited (429)");
+        await sleep(1500 * Math.pow(2, attempt));
         continue;
       }
 
       if (!res.ok) {
         const err = await res.text();
         throw new Error(`Groq ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+      return data.choices[0].message.content;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 2) await sleep(1000);
+    }
+  }
+  throw lastErr;
+}
+
+// Free vision-capable models on OpenRouter, ranked by quality.
+// All support image inputs. Fallback chain used when models 404 or 429.
+const VISION_MODELS = [
+  "google/gemma-3-27b-it:free",
+  "mistralai/mistral-small-3.1-24b-instruct:free",
+  "google/gemma-3-12b-it:free",
+  "nvidia/nemotron-nano-12b-v2-vl:free",
+  "google/gemma-3-4b-it:free",
+];
+
+// Tries vision models in order until one succeeds (falls through on 404 and 429)
+async function callOpenRouterVision(messages, opts = {}) {
+  let lastErr;
+  for (const model of VISION_MODELS) {
+    try {
+      const result = await callOpenRouter(model, messages, opts);
+      console.log("BG: Vision model used:", model);
+      return result;
+    } catch (e) {
+      console.warn(`BG: Vision model ${model} failed:`, e.message);
+      lastErr = e;
+      // Try next model on 404 (not available) or 429 (rate limited)
+      const msg = e.message || "";
+      const shouldFallthrough = msg.includes("404") || msg.includes("429") ||
+        msg.includes("No endpoints") || msg.includes("rate limit") || msg.includes("guardrail");
+      if (!shouldFallthrough) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+async function callOpenRouter(model, messages, { jsonMode = false } = {}) {
+  if (!openRouterApiKey) throw new Error("OpenRouter API key not set");
+
+  const body = {
+    model,
+    messages,
+    temperature: 0.1,
+    max_tokens: 4096,
+  };
+  if (jsonMode) body.response_format = { type: "json_object" };
+
+  let lastErr = new Error("OpenRouter: all attempts failed");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(OPENROUTER_BASE, {
+        method: "POST",
+        signal: AbortSignal.timeout(60000),
+        headers: {
+          "Authorization": `Bearer ${openRouterApiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://github.com/ctrl-agent",
+          "X-Title": "ctrl"
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (res.status === 429) {
+        lastErr = new Error("OpenRouter: rate limited (429)");
+        await sleep(1500 * Math.pow(2, attempt));
+        continue;
+      }
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`OpenRouter ${res.status}: ${err}`);
       }
 
       const data = await res.json();
@@ -635,12 +935,12 @@ async function runOrchestrator(intentText, currentTab) {
 
 - taskType: "simple" | "multi-step" | "multi-tab-parallel" | "workflow-replay"
 - skill: matching skill name or null
-- steps: ordered step descriptions for multi-step tasks (max 5)
+- steps: ALWAYS include 2-5 ordered steps describing what you will do, even for simple tasks. E.g. ["Navigate to Perplexity.ai", "Enter the research query", "Extract key findings and sources"]
 - parallelSubtasks: [{subGoal, startUrl}] for multi-tab-parallel only
 - workflowName: string for workflow-replay only
 - clarificationNeeded: true if you need more info from the user before planning
 - clarificationQuestion: the question to ask the user (short, voice-friendly, 1 sentence)
-- planSummary: a short voice-friendly summary of what you will do (1-2 sentences, spoken aloud to user before execution)
+- planSummary: a voice-friendly 1-sentence summary referencing the tool or site being used. E.g. "I'll use Perplexity to research best laptops under 50,000 rupees." or "I'll open Gamma.app and generate a 10-slide deck on climate change."
 
 Available skills:
 ${skillList}
@@ -651,19 +951,27 @@ Rules:
 - "multi-tab-parallel" = user explicitly wants to compare across 2+ different websites at once
 - "workflow-replay" = user references a saved workflow by name
 
-Clarification rules — set clarificationNeeded=true when:
-- Intent is ambiguous about which platform to use (shopping → Amazon vs Flipkart vs eBay? / music → Spotify vs YouTube?)
-- Intent is vague about what exactly to do (e.g. "find something good" with no domain)
-- Critical information is missing (searching for what? buying what?)
-- Do NOT ask for clarification when the intent is already clear enough to act on
+Clarification rules — DEFAULT is clarificationNeeded=false. ONLY set true when:
+- The request names absolutely NO product, topic, or subject (e.g. bare "buy something" with nothing else)
+- AND no site is mentioned
+- NEVER ask if ANY site is mentioned (amazon, youtube, flipkart, reddit, etc.)
+- NEVER ask if ANY product, topic, or action word is present
+- NEVER ask for tasks that mention a specific URL or search query
+- When in doubt: clarificationNeeded=false and just attempt the task
 
 planSummary rules:
-- Always populate this, even for simple tasks
-- Write as if you're telling the user what you're about to do
-- Example: "I'll navigate to YouTube and search for cat videos."
-- Example: "I'll fill out the registration form with your details in 3 steps."
+- Keep it one short sentence: "I'll [action] on [site]."
+- Do NOT ask questions in planSummary — it's a statement, not a question
 
-The vision agent handles all navigation — just describe WHAT to do, not HOW to navigate.
+AI TOOL ROUTING — for these tasks, ALWAYS prefer the specialized skill listed:
+- "presentation", "slides", "deck", "ppt", "pitch deck", "slideshow" → skill: ppt-gamma
+- "research", "deep search", "look up", "find information about", "learn about" → skill: research-perplexity
+- "compare prices", "cheapest", "best price", "best deal", "how much does X cost" → skill: price-compare
+- "summarize video", "summarize this youtube", "what is this video about", "video summary" → skill: youtube-summarize
+- "design", "UI mockup", "landing page design", "app design", "interface" → skill: design-stitch
+- "fill this form", "apply", "sign up", "register", "checkout form" → skill: form-fill
+
+The vision agent handles all navigation — just describe WHAT to do.
 Return ONLY valid JSON.`;
 
   const userMsg = `Intent: "${intentText}"
@@ -671,7 +979,7 @@ Current URL: ${currentTab?.url || "unknown"}
 Page title: ${currentTab?.title || "unknown"}`;
 
   try {
-    const raw = await callGroq("openai/gpt-oss-20b", [
+    const raw = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [
       { role: "system", content: systemPrompt },
       { role: "user", content: userMsg }
     ], { jsonMode: true });
@@ -687,61 +995,98 @@ Page title: ${currentTab?.title || "unknown"}`;
 }
 
 // ---- Vision Action Agent Loop ----
-const VISION_SYSTEM_PROMPT = `You are a precise browser automation agent controlling a real browser via CDP.
+const VISION_SYSTEM_PROMPT = `You are a precise browser automation agent controlling a real Chrome browser via CDP.
 
 Each round you receive:
-1. An annotated screenshot — colored numbered boxes mark every interactive element
-2. A numbered element list matching those boxes
-3. CURRENT URL and page title
-4. The task/goal, round number, previously failed elements, extracted data so far
+1. An annotated screenshot — numbered colored boxes mark every interactive element
+2. A CLICKABLE ELEMENTS list — each line is "[N] Role "Name" (x:CX y:CY)" where N is the index
+3. Current URL, page title, task, round number
 
-OUTPUT — always return exactly this JSON shape:
+OUTPUT — return exactly this JSON (no markdown, no extra keys):
 {
-  "thought": "1-2 sentence reasoning: where am I, what do I see, what's my next move",
+  "thought": "1-2 sentences: what page am I on, which element do I need, what INDEX will I use",
   "actions": [...],
-  "done": false,
-  "extractedData": {}
+  "done": false
 }
 
-ACTION TYPES:
-- {"type": "navigate", "url": "https://..."}           ← go to a URL directly
-- {"type": "click", "elementIndex": N}
-- {"type": "type", "elementIndex": N, "value": "text", "clear": true}
-- {"type": "scroll", "direction": "down"|"up", "amount": 400}
-- {"type": "keypress", "key": "Enter"|"Tab"|"Escape"|"ArrowDown", "elementIndex": N}
-- {"type": "select", "elementIndex": N, "value": "option text"}
-- {"type": "extract", "fields": {"fieldName": "description of value to capture"}}
-- {"type": "wait", "ms": 500}
+ACTIONS:
+{"type":"navigate","url":"https://..."}                     ← navigate to URL
+{"type":"click","index":N}                                  ← click element N from CLICKABLE ELEMENTS list
+{"type":"type","index":N,"value":"text","clear":true}       ← focus element N and type
+{"type":"scroll","direction":"down","amount":400}            ← scroll page
+{"type":"keypress","key":"Enter"}                            ← sends key to last focused element
+{"type":"wait","ms":2000}                                    ← wait (use for page loads, AI generation)
+{"type":"extract","fields":{"fieldName":"what to capture"}} ← record data visible on page
+{"type":"dismiss_popup"}                                     ← Escape + click away to close overlays
 
-NAVIGATION RULES — READ CAREFULLY:
-- If the task requires a website different from CURRENT URL, your FIRST action MUST be navigate to that site's URL. Do NOT use any search box on the current page to get there.
-- Examples:
-    task="open YouTube", current url="chatgpt.com" → {"type":"navigate","url":"https://youtube.com"}
-    task="go to gmail", current url="google.com"   → {"type":"navigate","url":"https://mail.google.com"}
-    task="search cat videos on youtube", current url="chatgpt.com" → FIRST navigate to https://youtube.com, THEN search
-- Always construct the correct full URL yourself. Never rely on the current page's search.
+HOW TO USE THE ELEMENT LIST:
+- Indices are 1-BASED: [1] is the first element. NEVER use [0] — it does not exist.
+- Find the element you want in the CLICKABLE ELEMENTS list by its role and name description
+- Use its NUMBER as the "index" value: {"type":"click","index":3}
+- For text inputs (Textbox, Searchbox, Combobox): use {"type":"type","index":N,"value":"text","clear":true} DIRECTLY — the type action handles focus automatically, do NOT click them first
+- NEVER click a Textbox or Searchbox — always use the type action on them
+- NEVER copy x,y coordinates into your actions — use the index number only
+- The (x:, y:) shown are for visual reference only
 
-EXECUTION RULES:
-1. Reference elements by NUMBER ONLY — never guess coordinates.
-2. Do not retry failed elements — find an alternative approach.
-3. Set done=true only when the task is fully complete or truly impossible.
-4. Extract data before navigating away from a page that has it.
-5. For SPAs/dynamic pages: after clicking something that loads content, add {"type":"wait","ms":800} before the next action.
-6. Return only the JSON object — no markdown, no commentary.`;
+NAVIGATION:
+- Task needs a different site → FIRST action MUST be {"type":"navigate","url":"https://full-url.com"}
+- NEVER click the browser address bar — use navigate action only
+- NEVER use the current page's search bar to go to a different website
+
+WAITING FOR AI GENERATION:
+- After triggering generation (Gamma slides, Perplexity search, etc.), use {"type":"wait","ms":5000}
+- Then take a screenshot to check progress. Repeat waiting if still loading.
+- Generation can take 10-30 seconds — be patient and keep checking
+
+RULES:
+1. Output at least one action every round unless done=true
+2. Set done=true ONLY when the task is fully and visibly complete on screen
+3. After navigation or clicks that load new content, add {"type":"wait","ms":1500}
+4. If an element is not in the list, scroll down and look for it
+5. If a click has no effect, try a different element or approach — do NOT keep clicking the same thing
+6. Return ONLY the JSON object — no markdown, no extra text`;
 
 async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null) {
   console.log("BG: VisionActionAgent start — tab:", tabId, "goal:", goal, "skill:", skillName);
   const skill = skillName ? getSkill(skillName) : null;
   const systemPrompt = VISION_SYSTEM_PROMPT + (skill?.systemPromptAddition ? "\n\n" + skill.systemPromptAddition : "");
+  const maxRounds = skill?.maxRounds ?? MAX_ROUNDS;
 
-  let failedElements = [];
   let extractedData = {};
   let round = 0;
   let lastThought = "";
+  let consecutiveFailures = 0;
+  let noActionRounds = 0;
+  let lastClickKey = null;      // stuck-detection: tracks "idx:N" or "xy:X,Y"
+  let sameClickCount = 0;
+  let clickNoEffectCount = 0;   // change-detection: consecutive clicks with no URL/title change
+  let lastClickedIdx = null;
+  // Running log of completed actions — shown to the model each round so it doesn't backtrack
+  const completedActions = [];
 
   broadcastEvent({ type: "AGENT_START", tabId, goal, skill: skillName });
 
-  while (round < MAX_ROUNDS) {
+  // If the skill requires a specific starting URL, navigate there NOW via CDP
+  // before round 1. This is guaranteed — the LLM cannot skip it.
+  if (skill?.startUrl) {
+    try {
+      const currentTab = await chrome.tabs.get(tabId);
+      const currentUrl = currentTab.url || "";
+      const targetHost = new URL(skill.startUrl).hostname.replace(/^www\./, "");
+      if (!currentUrl.includes(targetHost)) {
+        console.log("BG: Pre-navigating to skill startUrl:", skill.startUrl);
+        broadcastEvent({ type: "EXECUTING", tabId, action: { type: "navigate", url: skill.startUrl }, elementName: `Navigate to ${skill.startUrl}` });
+        await executeCdpAction(tabId, { type: "navigate", url: skill.startUrl }, new Map());
+        await waitForPageSettle(tabId);
+        await sleep(NAVIGATE_SETTLE_MS);
+        broadcastEvent({ type: "ACTION_VERIFIED", tabId, action: { type: "navigate", url: skill.startUrl } });
+      }
+    } catch (e) {
+      console.warn("BG: pre-navigate failed, continuing anyway:", e.message);
+    }
+  }
+
+  while (round < maxRounds) {
     if (signal?.aborted) {
       broadcastEvent({ type: "AGENT_ABORTED", tabId });
       return { aborted: true };
@@ -750,7 +1095,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
     round++;
     broadcastEvent({ type: "PERCEIVING", tabId, round });
 
-    // Build annotated screenshot
+    // Build annotated screenshot with CSS-pixel coordinates
     console.log("BG: Building annotated screenshot, round", round);
     let annotatedB64, elementList, elementMap;
     try {
@@ -770,7 +1115,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       currentTitle = tab.title || "unknown";
     } catch { }
 
-    // Build prompt
+    // Build prompt — element list now includes exact (x, y) coordinates
     const userContent = [
       {
         type: "image_url",
@@ -782,29 +1127,30 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
           `CURRENT URL: ${currentUrl}`,
           `PAGE TITLE: ${currentTitle}`,
           `TASK: ${goal}`,
-          `Round: ${round}/${MAX_ROUNDS}`,
-          failedElements.length ? `Failed elements (do NOT retry): [${failedElements.join(", ")}]` : "",
+          `Round: ${round}/${maxRounds}`,
           Object.keys(extractedData).length ? `Data extracted so far: ${JSON.stringify(extractedData)}` : "",
+          completedActions.length ? `Steps already completed (DO NOT repeat these):\n${completedActions.map((a, i) => `  ${i + 1}. ${a}`).join("\n")}` : "",
           lastThought ? `Previous thought: ${lastThought}` : "",
           "",
-          "INTERACTIVE ELEMENTS ON PAGE:",
+          "CLICKABLE ELEMENTS (indices are 1-based — [1] is first, never use [0]):",
           elementList
         ].filter(Boolean).join("\n")
       }
     ];
 
-    // Call 120b
-    console.log("BG: Calling 120b for action decision...");
+    // Call vision action model via OpenRouter — Gemma 3 27B is the best free vision model
+    console.log("BG: Calling vision model for action decision...");
     broadcastEvent({ type: "THINKING", tabId });
     let response;
     try {
-      response = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [
+      response = await callOpenRouterVision([
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent }
       ], { jsonMode: true });
     } catch (e) {
-      console.error("BG: 120b call failed:", e.message);
-      broadcastEvent({ type: "ACTION_FAILED", tabId, error: e.message });
+      const msg = e?.message || String(e) || "Unknown API error";
+      console.error("BG: Vision model call failed:", msg);
+      broadcastEvent({ type: "ACTION_FAILED", tabId, error: msg });
       if (signal?.aborted) break;
       await sleep(2000);
       continue;
@@ -825,10 +1171,33 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
 
     broadcastEvent({ type: "THOUGHT", tabId, thought: lastThought });
 
+    // Every 4 rounds, send a voice update so the user knows we're still working
+    if (round % 4 === 0 && !done) {
+      const shortThought = lastThought?.split(".")[0] || "Still working on it";
+      sendToGeminiLive(`[STATUS: ${shortThought}]`);
+    }
+
     if (done) {
       broadcastEvent({ type: "AGENT_DONE", tabId, extractedData });
       break;
     }
+
+    // No actions returned — give the model one more chance then bail
+    if (actions.length === 0) {
+      noActionRounds++;
+      console.warn("BG: Model returned 0 actions, noActionRounds:", noActionRounds);
+      broadcastEvent({ type: "ACTION_FAILED", tabId, observation: "No actions returned" });
+      if (noActionRounds >= 2) {
+        console.error("BG: Agent stuck — 2 rounds with no actions, aborting");
+        broadcastEvent({ type: "TASK_FAILED", error: "Agent stuck: no actions produced" });
+        sendToGeminiLive("[TASK_FAILED: Agent could not determine next action]");
+        break;
+      }
+      lastThought = "You must output at least one action. If the page needs navigation, navigate now.";
+      await sleep(500);
+      continue;
+    }
+    noActionRounds = 0;
 
     // Execute each action
     for (const action of actions) {
@@ -838,7 +1207,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       if (SENSITIVE_ACTIONS.has(action.type)) {
         const desc = action.type === "navigate"
           ? `navigate to ${action.url}`
-          : `type "${action.value}" into element ${action.elementIndex}`;
+          : `type "${action.value}"`;
         const perm = await showPermissionAndWait(tabId, desc);
         if (!perm) {
           broadcastEvent({ type: "ACTION_DENIED", tabId, action });
@@ -846,25 +1215,41 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
         }
       }
 
-      // Before screenshot for confirmation
-      let beforeB64;
-      try {
-        const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
-        beforeB64 = s.data;
-      } catch { }
+      // Describe action for the log (prefer index over coordinates)
+      const clickRef = action.index != null ? `[${action.index}]` : `(${action.x},${action.y})`;
+      const actionLabel = action.type === "click"
+        ? `Click ${clickRef}`
+        : action.type === "type"
+          ? `Type "${action.value?.slice(0, 40)}" on ${action.index != null ? `[${action.index}]` : `(${action.x},${action.y})`}`
+          : action.type === "navigate"
+            ? `Navigate to ${action.url}`
+            : action.type;
+      broadcastEvent({ type: "EXECUTING", tabId, action, elementName: actionLabel });
 
-      broadcastEvent({ type: "EXECUTING", tabId, action, elementName: elementMap.get(action.elementIndex)?.name });
+      // Snapshot URL+title before click for change-detection
+      let preUrl = null, preTitle = null;
+      if (action.type === "click") {
+        try { const t = await chrome.tabs.get(tabId); preUrl = t.url || ""; preTitle = t.title || ""; } catch {}
+      }
 
       try {
         await executeCdpAction(tabId, action, elementMap);
+        consecutiveFailures = 0;
       } catch (e) {
-        console.warn("BG: action failed", action, e);
-        if (action.elementIndex) failedElements.push(action.elementIndex);
-        broadcastEvent({ type: "ACTION_FAILED", tabId, action, error: e.message });
+        consecutiveFailures++;
+        const msg = e?.message || String(e);
+        console.warn("BG: action failed", action.type, msg);
+        broadcastEvent({ type: "ACTION_FAILED", tabId, action, error: msg });
+        if (consecutiveFailures >= 3) {
+          try { await executeCdpAction(tabId, { type: "scroll", direction: "down", amount: 400 }, new Map()); } catch {}
+          consecutiveFailures = 0;
+          lastThought = "Multiple actions failed. Scrolled down. Reassess what is visible and try a different element or approach.";
+          await sleep(600);
+        }
         continue;
       }
 
-      // Settle
+      // Settle after action
       if (action.type === "navigate") {
         await waitForPageSettle(tabId);
         await sleep(NAVIGATE_SETTLE_MS);
@@ -872,18 +1257,82 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
         await sleep(SETTLE_MS);
       }
 
-      // After screenshot
-      let afterB64;
-      try {
-        const s = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 40 });
-        afterB64 = s.data;
-      } catch { }
+      broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
 
-      // Confirm action (non-blocking for wait/extract)
-      if (action.type !== "wait" && action.type !== "extract" && beforeB64 && afterB64) {
-        runConfirmation(action, beforeB64, afterB64, tabId, failedElements);
-      } else {
-        broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
+      // Log meaningful completed actions so the model doesn't backtrack
+      if (action.type === "navigate") {
+        completedActions.push(`Navigated to ${action.url}`);
+      } else if (action.type === "type") {
+        completedActions.push(`Typed "${action.value?.slice(0, 60)}" into element [${action.index ?? action.elementIndex}]`);
+      } else if (action.type === "click") {
+        const elForLog = (action.index ?? action.elementIndex) != null
+          ? elementMap.get(Number(action.index ?? action.elementIndex))
+          : null;
+        const elDesc = elForLog ? `"${elForLog.name || elForLog.role}" [${action.index ?? action.elementIndex}]` : `[${action.index ?? action.elementIndex}]`;
+        completedActions.push(`Clicked ${elDesc}`);
+      } else if (action.type === "wait") {
+        completedActions.push(`Waited ${action.ms}ms`);
+      }
+
+      // ---- Post-click change detection ----
+      if (action.type === "click" && preUrl !== null) {
+        let postUrl = "", postTitle = "";
+        try { const t = await chrome.tabs.get(tabId); postUrl = t.url || ""; postTitle = t.title || ""; } catch {}
+        const unchanged = postUrl === preUrl && postTitle === preTitle;
+        const clickIdx = action.index ?? null;
+
+        // Clicking a textbox/searchbox/combobox only focuses it — URL/title won't change.
+        // This is a valid and expected effect, so skip no-effect detection for input roles.
+        const clickedEl = clickIdx != null ? elementMap.get(Number(clickIdx)) : null;
+        const INPUT_ROLES = new Set(["textbox", "searchbox", "combobox", "spinbutton"]);
+        const isInputFocus = clickedEl && INPUT_ROLES.has(clickedEl.role);
+
+        if (unchanged && !isInputFocus) {
+          clickNoEffectCount++;
+          if (clickNoEffectCount >= 3 && clickIdx === lastClickedIdx) {
+            // Escalate to JS click — triggers React/SPA synthetic events
+            console.warn("BG: 3 no-effect clicks on same element, escalating to JS click for index", clickIdx);
+            const el = clickIdx != null ? elementMap.get(Number(clickIdx)) : null;
+            if (el?.backendNodeId) {
+              try {
+                await jsClickElement(tabId, el.backendNodeId);
+                await sleep(SETTLE_MS * 2);
+                clickNoEffectCount = 0;
+                lastThought = `JS click was used on element [${clickIdx}] because CDP mouse events had no effect. Check if anything changed and continue accordingly.`;
+              } catch (e2) {
+                console.warn("BG: JS click fallback also failed:", e2.message);
+                lastThought = `Both CDP and JS click on element [${clickIdx}] had no effect. This element may not be interactive. Try a completely different approach, scroll to find other elements, or navigate away.`;
+              }
+            } else {
+              lastThought = `Click at ${clickRef} had no visible effect 3 times. Try a different element or approach.`;
+            }
+          } else {
+            lastThought = `Click on ${clickRef} had no visible effect (URL and title unchanged). If this keeps happening, try scrolling, clicking a different element, or using navigate.`;
+          }
+        } else {
+          clickNoEffectCount = 0; // click worked — reset
+        }
+        lastClickedIdx = clickIdx;
+      }
+
+      // ---- Stuck-detection: same element/coord clicked 3+ times in a row ----
+      if (action.type === "click") {
+        const key = action.index != null ? `idx:${action.index}` : `xy:${action.x},${action.y}`;
+        if (key === lastClickKey) {
+          sameClickCount++;
+          if (sameClickCount >= 4) {
+            console.warn("BG: stuck — same element clicked 4x, injecting strong hint");
+            lastThought = `You have clicked element ${clickRef} ${sameClickCount} times with no progress. STOP. This element is either unresponsive or the wrong target. Try: scroll down to find different elements, use a navigate action to go to a different URL, or re-read the task and choose a completely different approach.`;
+            sameClickCount = 0;
+          }
+        } else {
+          lastClickKey = key;
+          sameClickCount = 1;
+        }
+      } else if (action.type === "navigate") {
+        lastClickKey = null;
+        sameClickCount = 0;
+        clickNoEffectCount = 0;
       }
     }
   }
@@ -897,49 +1346,6 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
   return extractedData;
 }
 
-// ---- Confirmation Agent (fire-and-update, non-blocking) ----
-async function runConfirmation(action, beforeB64, afterB64, tabId, failedElements) {
-  const actionDesc = action.type === "click"
-    ? `click on element ${action.elementIndex}`
-    : action.type === "type"
-      ? `type "${action.value}" into element ${action.elementIndex}`
-      : action.type;
-
-  const prompt = `You are verifying if a browser action succeeded.
-Action taken: ${actionDesc}
-
-Compare the before and after screenshots.
-Return JSON: {"success": boolean, "observation": "brief description of what changed", "retry_hint": ""}
-
-If the page changed meaningfully (new content appeared, form submitted, navigation occurred, element state changed) → success: true.
-If nothing changed or an error appeared → success: false with retry_hint explaining what to try instead.`;
-
-  try {
-    const raw = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${beforeB64}` } },
-          { type: "text", text: "AFTER:" },
-          { type: "image_url", image_url: { url: `data:image/jpeg;base64,${afterB64}` } }
-        ]
-      }
-    ], { jsonMode: true });
-
-    const { success, observation, retry_hint } = JSON.parse(raw);
-    if (!success && action.elementIndex) {
-      failedElements.push(action.elementIndex);
-    }
-    broadcastEvent({
-      type: success ? "ACTION_VERIFIED" : "ACTION_FAILED",
-      tabId, action, observation, retry_hint
-    });
-  } catch (e) {
-    // Confirmation failed — assume success to not block the loop
-    broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
-  }
-}
 
 // ---- Permission banner ----
 async function showPermissionAndWait(tabId, description) {
@@ -1010,7 +1416,7 @@ ${extractedParts.map((d, i) => `Source ${i + 1} (${parallelSubtasks[i].startUrl}
 
 Write a clear, concise answer comparing the data. Be specific with numbers and names.`;
 
-    const summary = await callGroq("openai/gpt-oss-20b", [
+    const summary = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [
       { role: "user", content: mergePrompt }
     ]);
 
@@ -1026,6 +1432,26 @@ Write a clear, concise answer comparing the data. Be specific with numbers and n
   }
 }
 
+// ---- Screen description (for visual-reference intents) ----
+const SCREEN_REF = /\b(on screen|on the screen|this page|current page|what i see|what('s| is) on|like this|this one|looking at|can you see|see this|visible|showing|displayed|screenshot|this tab|current tab)\b/i;
+
+async function describeCurrentScreen(tabId) {
+  try {
+    const { data: b64 } = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 70 });
+    const raw = await callOpenRouterVision([{
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } },
+        { type: "text", text: "Describe what is on this webpage in 1-2 sentences. Focus on the main content, product, or subject that is visible. Be specific about names, prices, or key details." }
+      ]
+    }]);
+    return raw?.trim() || null;
+  } catch (e) {
+    console.warn("BG: screen describe failed", e);
+    return null;
+  }
+}
+
 // ---- Main task dispatcher ----
 async function dispatchTask(intentText, currentTab) {
   console.log("BG: dispatchTask:", intentText, "| tab:", currentTab?.url);
@@ -1033,6 +1459,36 @@ async function dispatchTask(intentText, currentTab) {
   abortController = new AbortController();
 
   broadcastEvent({ type: "TASK_DISPATCHED", intentText });
+
+  // If user references the screen, proactively describe it and reformulate into a concrete goal
+  if (SCREEN_REF.test(intentText) && currentTab?.id) {
+    broadcastEvent({ type: "SCREEN_ANALYZING" });
+    sendToGeminiLive("[STATUS: Let me analyze your screen first...]");
+    const screenDesc = await describeCurrentScreen(currentTab.id);
+    if (screenDesc) {
+      console.log("BG: Screen described:", screenDesc);
+      broadcastEvent({ type: "SCREEN_ANALYZED", description: screenDesc });
+      // Reformulate the intent into a concrete actionable goal so the agent
+      // doesn't confuse "what's on screen now" with "what to do next"
+      try {
+        const reformulated = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", [{
+          role: "system",
+          content: "You rewrite vague user requests that reference 'the screen' into concrete, actionable browser automation goals. Remove all references to 'the screen', 'this', 'what I see' and replace with specific details from the screen context. Output only the rewritten goal, nothing else."
+        }, {
+          role: "user",
+          content: `User request: "${intentText}"\nScreen shows: ${screenDesc}\nCurrent URL: ${currentTab?.url || "unknown"}\n\nRewrite as a concrete goal (e.g. "Go to amazon.com and search for [specific item from screen]"):`
+        }]);
+        if (reformulated?.trim()) {
+          intentText = reformulated.trim();
+          console.log("BG: Reformulated intent:", intentText);
+          broadcastEvent({ type: "INTENT_DETECTED", intentText });
+        }
+      } catch (e) {
+        // Fallback: append context manually
+        intentText = `${intentText} [SCREEN SHOWS: ${screenDesc}]`;
+      }
+    }
+  }
 
   let decision;
   try {
@@ -1044,32 +1500,39 @@ async function dispatchTask(intentText, currentTab) {
 
   if (abortController.signal.aborted) return;
 
-  // Need clarification before planning
+  // Clarification — only when truly needed (orchestrator rule is very strict now)
   if (decision.clarificationNeeded && decision.clarificationQuestion) {
     console.log("BG: Clarification needed:", decision.clarificationQuestion);
     pendingTask = { intentText, decision, tab: currentTab, step: "clarify" };
+    pendingTaskCooldownUntil = Date.now() + 3500; // 3.5s: enough for Gemini to begin speaking the question
     broadcastEvent({ type: "PLAN_ANNOUNCED", planText: decision.clarificationQuestion });
     sendToGeminiLive(`[QUESTION: ${decision.clarificationQuestion}]`);
     return;
   }
 
-  // Multi-step: announce plan and ask for confirmation before executing
-  if (decision.taskType === "multi-step" && decision.steps?.length) {
-    const planText = decision.planSummary ||
-      `I'll complete this in ${decision.steps.length} steps: ${decision.steps.join(", then ")}. Should I go ahead?`;
-    console.log("BG: Announcing plan:", planText);
+  // Build a rich plan description including steps.
+  const stepList = decision.steps?.length
+    ? decision.steps.join(", then ")
+    : null;
+  const planText = stepList
+    ? `${decision.planSummary || "Here's my plan:"} Steps: ${stepList}.`
+    : (decision.planSummary || "I'll take care of that now.");
+
+  // Only pause and ask "should I go ahead?" for explicitly multi-step or multi-tab tasks.
+  // All other tasks (including skill tasks) announce the plan and execute immediately —
+  // the user hears the plan but doesn't need to confirm for every single action.
+  const needsConfirm = decision.taskType === "multi-step" || decision.taskType === "multi-tab-parallel";
+  if (needsConfirm) {
     pendingTask = { intentText, decision, tab: currentTab, step: "confirm" };
+    pendingTaskCooldownUntil = Date.now() + 3000;
     broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
     sendToGeminiLive(`[PLAN: ${planText}]`);
     return;
   }
 
-  // Simple tasks: announce briefly then execute immediately
-  if (decision.planSummary) {
-    sendToGeminiLive(`[PLAN: ${decision.planSummary}]`);
-    await sleep(300); // brief pause so Gemini starts speaking before we act
-  }
-
+  // For simple or skill tasks: narrate the plan then execute immediately.
+  broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
+  if (planText) sendToGeminiLive(`[STATUS: ${planText}]`);
   await executePlan(decision, intentText, currentTab);
 }
 
@@ -1078,46 +1541,100 @@ async function executePlan(decision, intentText, currentTab) {
   if (abortController) abortController.abort();
   abortController = new AbortController();
   const { signal } = abortController;
+  isTaskRunning = true;
 
-  const { taskType, skill, steps, parallelSubtasks } = decision;
+  try {
+    const { taskType, skill, steps, parallelSubtasks } = decision;
 
-  if (taskType === "workflow-replay") {
-    await replayWorkflow(decision.workflowName, currentTab?.id, signal);
-    return;
-  }
-
-  if (taskType === "multi-tab-parallel") {
-    await runMultiTabTask(decision, intentText, signal);
-    return;
-  }
-
-  const tabId = currentTab?.id;
-  if (!tabId) {
-    broadcastEvent({ type: "TASK_FAILED", error: "No active tab" });
-    return;
-  }
-
-  if (taskType === "simple" || !steps?.length) {
-    const result = await runVisionActionAgent(tabId, intentText, skill, null, null, signal);
-    if (!signal.aborted) {
-      const summary = typeof result === "object" && Object.keys(result).length
-        ? `Done. ${JSON.stringify(result)}`
-        : "Done.";
-      sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+    if (taskType === "workflow-replay") {
+      await replayWorkflow(decision.workflowName, currentTab?.id, signal);
+      return;
     }
-    return;
-  }
 
-  // Multi-step: run steps sequentially
-  for (let i = 0; i < steps.length; i++) {
-    if (signal.aborted) break;
-    broadcastEvent({ type: "STEP_START", step: i + 1, total: steps.length, desc: steps[i] });
-    await runVisionActionAgent(tabId, steps[i], skill, null, null, signal);
-    broadcastEvent({ type: "STEP_DONE", step: i + 1, total: steps.length });
-  }
+    if (taskType === "multi-tab-parallel") {
+      await runMultiTabTask(decision, intentText, signal);
+      return;
+    }
 
-  if (!signal.aborted) {
-    sendToGeminiLive(`[TASK_DONE: Completed all ${steps.length} steps for: ${intentText}]`);
+    const tabId = currentTab?.id;
+    if (!tabId) {
+      broadcastEvent({ type: "TASK_FAILED", error: "No active tab" });
+      sendToGeminiLive("[TASK_FAILED: No active tab found]");
+      return;
+    }
+
+    // Helper: run agent and handle errors cleanly
+    const runAgent = async (goal, skillName) => {
+      try {
+        return await runVisionActionAgent(tabId, goal, skillName, null, null, signal);
+      } catch (e) {
+        const msg = e?.message || String(e) || "Agent error";
+        console.error("BG: agent crashed:", msg);
+        broadcastEvent({ type: "TASK_FAILED", error: msg });
+        sendToGeminiLive(`[TASK_FAILED: ${msg}]`);
+        return null;
+      }
+    };
+
+    // If a skill is matched, always run as a SINGLE agent regardless of step count.
+    if (skill) {
+      const stepPreview = decision?.steps?.length
+        ? `Starting now. First: ${decision.steps[0]}.`
+        : `Starting now. I'll handle it step by step.`;
+      sendToGeminiLive(`[STATUS: ${stepPreview}]`);
+
+      // Augment the goal with stored user profile for form-fill
+      let agentGoal = intentText;
+      if (skill === "form-fill") {
+        try {
+          const profile = await getUserProfile();
+          const profileStr = formatProfileForAgent(profile);
+          if (profileStr) agentGoal = agentGoal + "\n\nUser profile for form filling: " + profileStr;
+        } catch (e) {
+          console.warn("BG: failed to load user profile for form-fill", e);
+        }
+      }
+
+      const result = await runAgent(agentGoal, skill);
+      if (result !== null && !signal.aborted) {
+        const summary = typeof result === "object" && Object.keys(result).length
+          ? `Done. ${JSON.stringify(result)}`
+          : "Done.";
+        sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+      }
+      return;
+    }
+
+    if (taskType === "simple" || !steps?.length) {
+      const result = await runAgent(intentText, null);
+      if (result !== null && !signal.aborted) {
+        const summary = typeof result === "object" && Object.keys(result).length
+          ? `Done. ${JSON.stringify(result)}`
+          : "Done.";
+        sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+      }
+      return;
+    }
+
+    // True multi-step (no skill): run steps sequentially
+    for (let i = 0; i < steps.length; i++) {
+      if (signal.aborted) break;
+      broadcastEvent({ type: "STEP_START", step: i + 1, total: steps.length, desc: steps[i] });
+      sendToGeminiLive(`[STATUS: Step ${i + 1} of ${steps.length}: ${steps[i]}]`);
+      const stepGoal = `Overall goal: ${intentText}\nCurrent step ${i + 1} of ${steps.length}: ${steps[i]}`;
+      const res = await runAgent(stepGoal, null);
+      if (res === null) return; // agent crashed, already reported
+      broadcastEvent({ type: "STEP_DONE", step: i + 1, total: steps.length });
+      if (!signal.aborted && i < steps.length - 1) {
+        sendToGeminiLive(`[STATUS: Step ${i + 1} done. Moving to step ${i + 2}: ${steps[i + 1]}]`);
+      }
+    }
+
+    if (!signal.aborted) {
+      sendToGeminiLive(`[TASK_DONE: Completed all ${steps.length} steps for: ${intentText}]`);
+    }
+  } finally {
+    isTaskRunning = false;
   }
 }
 
@@ -1228,9 +1745,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "DISCONNECT_WEBSOCKET") {
     intentionalClose = true;
-    geminiSocket?.close();
-    geminiSocket = null;
-    intentionalClose = false;
+    if (geminiSocket) {
+      geminiSocket.onclose = null; // prevent auto-reconnect handler from firing
+      geminiSocket.close();
+      geminiSocket = null;
+    }
+    // intentionalClose stays true until connectGeminiLive is called next time
     sendResponse({ success: true });
     return;
   }
@@ -1239,6 +1759,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     groqApiKey = message.apiKey;
     chrome.storage.local.set({ groq_key: message.apiKey });
     console.log("BG: Groq key set");
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "SET_OPENROUTER_KEY") {
+    openRouterApiKey = message.apiKey;
+    chrome.storage.local.set({ openrouter_key: message.apiKey });
+    console.log("BG: OpenRouter key set");
     sendResponse({ success: true });
     return;
   }
@@ -1300,6 +1828,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "ABORT_TASK") {
     pendingTask = null;
+    isTaskRunning = false;
     abortController?.abort();
     broadcastEvent({ type: "TASK_ABORTED" });
     sendToGeminiLive("[TASK_FAILED: Task was cancelled by user]");

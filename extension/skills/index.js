@@ -8,16 +8,26 @@ import research from "./research.js";
 import email from "./email.js";
 import tabManager from "./tab-manager.js";
 import media from "./media.js";
+import pptGamma from "./ppt-gamma.js";
+import designStitch from "./design-stitch.js";
+import researchPerplexity from "./research-perplexity.js";
+import youtubeSummarize from "./youtube-summarize.js";
+import priceCompare from "./price-compare.js";
 
 // Built-in skills — ordered (first semantic match wins on ambiguous intents)
 const BUILT_IN_SKILLS = [
-  booking,       // check before form-fill so "book a table" doesn't become form-fill
+  pptGamma,           // specific: "make a presentation" before anything else
+  designStitch,       // specific: "design a UI / landing page"
+  youtubeSummarize,   // specific: "summarize this video"
+  booking,            // check before form-fill so "book a table" doesn't become form-fill
+  priceCompare,       // before shopping so "compare prices" doesn't become generic shopping
   shopping,
   email,
   media,
-  research,
+  researchPerplexity, // AI-powered deep research (Perplexity) — before generic research
+  research,           // fallback: in-page research / scraping
   tabManager,
-  formFill,      // last: most generic
+  formFill,           // last: most generic
 ];
 
 // Community skills loaded from chrome.storage.local
