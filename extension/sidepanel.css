@@ -271,6 +271,65 @@ footer {
   animation: pulse 1s infinite;
 }
 
+/* ---- Field question panel ---- */
+#field-question-panel {
+  background: #1a1a2e;
+  border: 1px solid #6366f1;
+  border-radius: 10px;
+  margin: 8px 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#field-question-text {
+  color: #e0e7ff;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+#field-input-row {
+  display: flex;
+  gap: 6px;
+}
+
+#field-answer-input {
+  flex: 1;
+  background: #0f0f1a;
+  border: 1px solid #4338ca;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 12px;
+  padding: 6px 10px;
+  outline: none;
+}
+
+#field-answer-input:focus {
+  border-color: #818cf8;
+}
+
+#field-answer-send {
+  background: #4f46e5;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 12px;
+}
+
+#field-answer-send:hover {
+  background: #6366f1;
+}
+
+#field-input-hint {
+  color: #6b7280;
+  font-size: 10px;
+}
+
 /* ---- Recording banner ---- */
 #recording-banner {
   position: absolute;
@@ -427,6 +486,54 @@ footer {
 }
 .workflow-item-name { color: #d4d4d8; }
 .workflow-item-date { color: #444; font-size: 10px; }
+
+/* ---- Profile memory list ---- */
+#profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.profile-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  background: #161616;
+  border: 1px solid #252525;
+  border-radius: 6px;
+  font-size: 11px;
+  gap: 8px;
+}
+
+.profile-item-key {
+  color: #818cf8;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.profile-item-value {
+  color: #a1a1aa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.profile-item-del {
+  background: none;
+  border: none;
+  color: #52525b;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.profile-item-del:hover { color: #f87171; }
 
 /* ---- Utilities ---- */
 .hidden { display: none !important; }

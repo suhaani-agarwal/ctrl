@@ -33,14 +33,16 @@ export async function saveProfileFields(fields) {
 
 /**
  * Format the user profile as a compact, human-readable string for injection into
- * the vision agent's goal prompt. Only includes fields that have values.
+ * the vision agent's goal prompt. Includes both well-known fields and any
+ * arbitrary keys saved by the form-fill skill.
  *
  * Example output:
- * "Name: Suhaan Agarwal | Email: suhaan@example.com | Phone: +91 98765 43210 | City: Mumbai"
+ * "Name: Suhaan Agarwal | Email: suhaan@example.com | portfolio_url: https://..."
  */
 export function formatProfileForAgent(profile) {
   if (!profile || typeof profile !== "object") return "";
 
+  // Well-known fields shown with friendly labels
   const LABEL_MAP = {
     fullName:     "Name",
     firstName:    "First name",
@@ -60,11 +62,28 @@ export function formatProfileForAgent(profile) {
     occupation:   "Occupation",
     company:      "Company",
     website:      "Website",
+    linkedin:     "LinkedIn URL",
+    linkedinUrl:  "LinkedIn URL",
+    github:       "GitHub URL",
+    githubUrl:    "GitHub URL",
   };
 
-  const parts = Object.entries(LABEL_MAP)
-    .filter(([key]) => profile[key])
-    .map(([key, label]) => `${label}: ${profile[key]}`);
+  const knownKeys = new Set(Object.keys(LABEL_MAP));
+  const parts = [];
+
+  // Well-known fields first
+  for (const [key, label] of Object.entries(LABEL_MAP)) {
+    if (profile[key]) parts.push(`${label}: ${profile[key]}`);
+  }
+
+  // Arbitrary fields saved by form-fill skill (skip internal chrome storage keys)
+  for (const [key, value] of Object.entries(profile)) {
+    if (!knownKeys.has(key) && value && typeof value === "string") {
+      // Convert snake_case keys to readable labels
+      const label = key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      parts.push(`${label}: ${value}`);
+    }
+  }
 
   return parts.join(" | ");
 }

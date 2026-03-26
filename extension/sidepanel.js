@@ -15,6 +15,10 @@ let currentAgentText = "";
 // ---- DOM refs ----
 const micBtn = document.getElementById("mic-btn");
 const abortBtn = document.getElementById("abort-btn");
+const fieldQuestionPanel = document.getElementById("field-question-panel");
+const fieldQuestionText = document.getElementById("field-question-text");
+const fieldAnswerInput = document.getElementById("field-answer-input");
+const fieldAnswerSend = document.getElementById("field-answer-send");
 const statusBadge = document.getElementById("status-badge");
 const taskCard = document.getElementById("task-card");
 const taskText = document.getElementById("task-text");
@@ -61,8 +65,46 @@ chrome.storage.local.get(["gemini_key", "groq_key", "openrouter_key", "permissio
 
 // ---- Settings ----
 const settingsCloseBtn = document.getElementById("settings-close-btn");
-settingsBtn.onclick = () => settingsDrawer.classList.toggle("hidden");
+settingsBtn.onclick = () => {
+  settingsDrawer.classList.toggle("hidden");
+  if (!settingsDrawer.classList.contains("hidden")) loadProfileList();
+};
 if (settingsCloseBtn) settingsCloseBtn.onclick = () => settingsDrawer.classList.add("hidden");
+
+// ---- Profile memory list ----
+const profileList = document.getElementById("profile-list");
+const profileEmptyHint = document.getElementById("profile-empty-hint");
+
+function loadProfileList() {
+  chrome.storage.local.get("user_profile", (res) => {
+    const profile = res.user_profile || {};
+    const entries = Object.entries(profile);
+    profileList.innerHTML = "";
+    if (entries.length === 0) {
+      profileEmptyHint.classList.remove("hidden");
+      return;
+    }
+    profileEmptyHint.classList.add("hidden");
+    for (const [key, value] of entries) {
+      const label = key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      const item = document.createElement("div");
+      item.className = "profile-item";
+      item.innerHTML = `
+        <span class="profile-item-key">${label}</span>
+        <span class="profile-item-value" title="${String(value)}">${String(value)}</span>
+        <button class="profile-item-del" title="Delete">✕</button>
+      `;
+      item.querySelector(".profile-item-del").onclick = () => {
+        chrome.storage.local.get("user_profile", (r) => {
+          const p = r.user_profile || {};
+          delete p[key];
+          chrome.storage.local.set({ user_profile: p }, () => loadProfileList());
+        });
+      };
+      profileList.appendChild(item);
+    }
+  });
+}
 
 geminiKeyInput?.addEventListener("change", (e) => {
   geminiKey = e.target.value.trim();
@@ -139,8 +181,37 @@ abortBtn.onclick = () => {
   msgBg({ type: "ABORT_TASK" });
   abortBtn.classList.add("hidden");
   taskCard.classList.add("hidden");
+  hideFieldQuestion();
   setStatus("idle");
 };
+
+// ---- Field answer input ----
+function showFieldQuestion(question, fieldKey, isSubjective) {
+  fieldQuestionText.textContent = question;
+  fieldAnswerInput.value = "";
+  fieldAnswerInput.dataset.fieldKey = fieldKey || "";
+  fieldQuestionPanel.classList.remove("hidden");
+  fieldAnswerInput.focus();
+  appendLog("❓", `Asking: ${question.slice(0, 80)}`, "thinking");
+}
+
+function hideFieldQuestion() {
+  fieldQuestionPanel.classList.add("hidden");
+  fieldAnswerInput.value = "";
+}
+
+function submitFieldAnswer() {
+  const text = fieldAnswerInput.value.trim();
+  if (!text) return;
+  hideFieldQuestion();
+  appendLog("💬", `You answered: ${text.slice(0, 60)}`, "");
+  msgBg({ type: "FIELD_ANSWER_TEXT", text });
+}
+
+fieldAnswerSend.onclick = submitFieldAnswer;
+fieldAnswerInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") submitFieldAnswer();
+});
 
 // ---- Record button ----
 recordBtn.onclick = () => {
@@ -343,6 +414,28 @@ function handleAgentEvent(event) {
 
     case "STEP_DONE":
       appendLog("✅", `Step ${event.step} complete`, "verified");
+      break;
+
+    case "FIELD_QUESTION":
+      showFieldQuestion(event.question, event.fieldKey, event.isSubjective);
+      appendTranscript("agent", `❓ ${event.question}`);
+      break;
+
+    case "FIELD_ANSWERED":
+      hideFieldQuestion();
+      if (event.answer) {
+        appendLog("💬", `Field "${event.fieldKey}": ${event.answer.slice(0, 60)}`, "verified");
+      } else if (event.timedOut) {
+        appendLog("⏰", `No answer for "${event.fieldKey}" — skipping`, "failed");
+      }
+      break;
+
+    case "FIELD_AUTO_FILLED":
+      appendLog("🗃️", `Profile match for "${event.fieldKey}": ${event.value?.slice(0, 50)}`, "verified");
+      break;
+
+    case "DRAFTING_CONTENT":
+      appendLog("✍️", `Drafting content for "${event.fieldKey}"...`, "thinking");
       break;
 
     case "AGENT_DONE":

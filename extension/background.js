@@ -1,7 +1,7 @@
 // background.js — Service worker. Central hub for all agent logic.
 // Imports skills registry (module type declared in manifest).
 import { initSkillRegistry, getAllSkills, getSkill, getSkillManifest } from "./skills/index.js";
-import { getUserProfile, formatProfileForAgent } from "./storage/user-profile.js";
+import { getUserProfile, saveProfileFields, formatProfileForAgent } from "./storage/user-profile.js";
 
 // ---- Constants ----
 const MAX_ROUNDS = 25; // default; skills can override with maxRounds
@@ -22,6 +22,7 @@ const MAX_RECONNECTS = 3;
 let nativePort = null;
 let abortController = null; // abort current task loop
 let pendingTask = null;     // { intentText, decision, tab, step: "clarify"|"confirm" }
+let pendingFieldQuestion = null; // { fieldKey, question, isSubjective, resolve } — pauses agent loop for user input
 let isTaskRunning = false;  // blocks ambient speech from aborting an in-progress task
 let pendingTaskCooldownUntil = 0; // ignore mic input for N ms after asking a question (prevents Gemini audio feedback)
 
@@ -95,6 +96,7 @@ function connectGeminiLive(gKey) {
               "CONFIRMATIONS — If you previously said a plan and user says 'yes', 'ok', 'go ahead', 'sure', 'do it': say 'Great, starting now!' — NO [INTENT:] needed.\n" +
               "STATUS UPDATES — When you receive [STATUS: text]: read it in 5 words or fewer as a progress update.\n" +
               "TASK DONE — When you receive [TASK_DONE: result]: say what was done in one sentence.\n" +
+              "FORM FIELD QUESTIONS — When you receive [FIELD_QUESTION: <question>]: read the question naturally and conversationally to the user. Do NOT output [INTENT:]. Just ask the question and wait for their response.\n" +
               "CONVERSATION — Greetings, jokes, general chat: respond naturally, no [INTENT:].\n\n" +
               "CRITICAL: The [INTENT:] line must appear on its own line immediately after your spoken phrase. Never skip it for browser tasks."
           }]
@@ -143,6 +145,123 @@ function sendToGeminiLive(textContent) {
   }
 }
 
+// ---- Form-fill: interactive user input ----
+
+/**
+ * Pauses the form-fill agent loop and asks the user a question via voice + sidepanel UI.
+ * Returns a Promise that resolves with the user's answer string (or null on timeout).
+ */
+function waitForUserFieldInput(question, fieldKey, isSubjective = false, timeout = 90000) {
+  return new Promise((resolve) => {
+    pendingFieldQuestion = { fieldKey, question, isSubjective, resolve };
+    // Speak the question via Gemini Live voice agent
+    sendToGeminiLive(`[FIELD_QUESTION: ${question}]`);
+    // Show text input UI in sidepanel
+    broadcastEvent({ type: "FIELD_QUESTION", question, fieldKey, isSubjective });
+    // Cooldown so Gemini's own audio isn't mistaken for the user's answer
+    pendingTaskCooldownUntil = Date.now() + 3500;
+    // Auto-timeout
+    setTimeout(() => {
+      if (pendingFieldQuestion?.resolve === resolve) {
+        console.log("BG: Field question timed out:", fieldKey);
+        pendingFieldQuestion = null;
+        broadcastEvent({ type: "FIELD_ANSWERED", fieldKey, answer: null, timedOut: true });
+        resolve(null);
+      }
+    }, timeout);
+  });
+}
+
+/**
+ * For subjective/creative form fields: takes the user's raw notes and drafts
+ * polished content using the LLM.
+ */
+async function draftSubjectiveContent(rawInput, fieldContext) {
+  const prompt = `You help users fill out form fields professionally.
+Field: "${fieldContext}"
+User's raw notes: "${rawInput}"
+Write a polished, natural response to fill this field. Be concise and compelling. Return ONLY the final text — no explanation, no quotes, no preamble.`;
+  try {
+    const result = await callGroq("meta-llama/llama-4-scout-17b-16e-instruct", [
+      { role: "user", content: prompt }
+    ]);
+    return result.trim();
+  } catch (e) {
+    console.warn("BG: draftSubjectiveContent failed:", e.message);
+    return rawInput;
+  }
+}
+
+/**
+ * Semantic matching: maps a vision-agent fieldKey to a stored profile value.
+ * Returns the value string or null.
+ */
+function findProfileMatch(profile, fieldKey) {
+  if (!profile) return null;
+  // Direct key match (e.g. agent used exact profile key)
+  if (profile[fieldKey]) return profile[fieldKey];
+
+  const norm = fieldKey.toLowerCase().replace(/[_\-\s]/g, "");
+  const ALIASES = {
+    fullname:        ["fullName"],
+    name:            ["fullName"],
+    yourname:        ["fullName"],
+    firstname:       ["firstName"],
+    givenname:       ["firstName"],
+    lastname:        ["lastName"],
+    surname:         ["lastName"],
+    familyname:      ["lastName"],
+    email:           ["email"],
+    emailaddress:    ["email"],
+    phone:           ["phone"],
+    mobile:          ["phone"],
+    phonenumber:     ["phone"],
+    contactnumber:   ["phone"],
+    website:         ["website"],
+    portfolio:       ["website"],
+    portfoliourl:    ["website"],
+    websiteurl:      ["website"],
+    personalwebsite: ["website"],
+    linkedin:        ["linkedin", "linkedinUrl"],
+    linkedinurl:     ["linkedin", "linkedinUrl"],
+    linkedinprofile: ["linkedin", "linkedinUrl"],
+    github:          ["github", "githubUrl"],
+    githuburl:       ["github", "githubUrl"],
+    githubprofile:   ["github", "githubUrl"],
+    city:            ["city"],
+    location:        ["city"],
+    state:           ["state"],
+    country:         ["country"],
+    pincode:         ["pincode"],
+    zipcode:         ["pincode"],
+    postalcode:      ["pincode"],
+    company:         ["company"],
+    organization:    ["company"],
+    employer:        ["company"],
+    occupation:      ["occupation"],
+    jobtitle:        ["occupation"],
+    title:           ["occupation"],
+    role:            ["occupation"],
+    gender:          ["gender"],
+    dob:             ["dateOfBirth"],
+    dateofbirth:     ["dateOfBirth"],
+    birthday:        ["dateOfBirth"],
+    fathername:      ["fatherName"],
+    mothername:      ["motherName"],
+    address:         ["addressLine1"],
+    addressline1:    ["addressLine1"],
+    addressline2:    ["addressLine2"],
+  };
+
+  const candidates = ALIASES[norm];
+  if (candidates) {
+    for (const k of candidates) {
+      if (profile[k]) return profile[k];
+    }
+  }
+  return null;
+}
+
 // Accumulate text across partial model turn messages before parsing for [INTENT:]
 let geminiTextBuffer = "";
 // Accumulate user speech transcription chunks
@@ -176,6 +295,22 @@ function handleGeminiLiveMessage(rawText) {
 
     if (fullText) {
       console.log("BG: Gemini full turn:", fullText.slice(0, 200));
+    }
+
+    // If waiting for a form field answer, route user speech there first
+    if (pendingFieldQuestion && userTranscript) {
+      const cleanAnswer = userTranscript.trim();
+      const cooldownPassed = Date.now() > pendingTaskCooldownUntil;
+      if (cooldownPassed && cleanAnswer.length > 0) {
+        console.log("BG: Routing speech to pending field question:", pendingFieldQuestion.fieldKey, "->", cleanAnswer.slice(0, 60));
+        const { fieldKey, resolve } = pendingFieldQuestion;
+        pendingFieldQuestion = null;
+        broadcastEvent({ type: "FIELD_ANSWERED", fieldKey, answer: cleanAnswer });
+        resolve(cleanAnswer);
+        return;
+      } else {
+        console.log("BG: Field question in cooldown, ignoring:", cleanAnswer.slice(0, 40));
+      }
     }
 
     // If waiting for user reply to a plan/clarification, route there first
@@ -883,8 +1018,8 @@ async function callGeminiVision(messages, { jsonMode = false } = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
-      if (res.status === 429) {
-        lastErr = new Error("Gemini vision: rate limited (429)");
+      if (res.status === 429 || res.status === 503) {
+        lastErr = new Error(`Gemini vision: ${res.status} (attempt ${attempt + 1})`);
         await sleep(2000 * Math.pow(2, attempt));
         continue;
       }
@@ -900,6 +1035,18 @@ async function callGeminiVision(messages, { jsonMode = false } = {}) {
       if (attempt < 2) await sleep(1000);
     }
   }
+
+  // Gemini overloaded — fall back to OpenRouter vision model
+  if (openRouterApiKey) {
+    console.warn("BG: Gemini vision failed, falling back to OpenRouter...");
+    try {
+      return await callOpenRouter("google/gemini-2.5-flash", messages, { jsonMode });
+    } catch (e2) {
+      console.warn("BG: OpenRouter vision fallback also failed:", e2.message);
+      throw lastErr;
+    }
+  }
+
   throw lastErr;
 }
 
@@ -1229,6 +1376,98 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
     // Execute each action
     for (const action of actions) {
       if (signal?.aborted) break;
+
+      // ---- ask_user: pause loop, check profile, then ask user if needed ----
+      if (action.type === "ask_user") {
+        const { fieldKey = "field", question = "What should I enter here?", isSubjective = false } = action;
+        broadcastEvent({ type: "EXECUTING", tabId, action, elementName: `Ask user: ${question.slice(0, 60)}` });
+
+        // 1. Check stored profile for a match
+        const profile = await getUserProfile();
+        let answer = findProfileMatch(profile, fieldKey);
+
+        if (answer) {
+          broadcastEvent({ type: "ACTION_VERIFIED", tabId, action, observation: `Using saved profile value for "${fieldKey}"` });
+          broadcastEvent({ type: "THOUGHT", tabId, thought: `Found "${fieldKey}" in saved profile: "${answer.slice(0, 60)}"` });
+          completedActions.push(`Auto-filled [${fieldKey}] from profile: "${answer.slice(0, 60)}"`);
+        } else {
+          // 2. Ask user via voice + sidepanel text input
+          broadcastEvent({ type: "THOUGHT", tabId, thought: `No profile match for "${fieldKey}" — asking user` });
+          answer = await waitForUserFieldInput(question, fieldKey, isSubjective);
+
+          if (!answer) {
+            broadcastEvent({ type: "ACTION_FAILED", tabId, action, error: `No answer received for "${fieldKey}"` });
+            lastThought = fieldKey === "submit_confirm"
+              ? "User did not confirm submit — do NOT submit the form. Ask if they want to review anything."
+              : `User did not answer for "${fieldKey}". Skip this field and continue with the remaining fields.`;
+            continue;
+          }
+
+          // submit_confirm: check if user approved
+          if (fieldKey === "submit_confirm") {
+            const confirmed = /\b(yes|yep|yeah|ok|okay|go|sure|do it|submit|confirm|proceed)\b/i.test(answer);
+            if (!confirmed) {
+              broadcastEvent({ type: "ACTION_VERIFIED", tabId, action, observation: "Submit cancelled by user" });
+              lastThought = "User said no to submitting. Do NOT submit. Ask if they want to change anything.";
+              completedActions.push("User declined submit — do NOT submit the form");
+              continue;
+            }
+            // Immediately click the submit button if the model included its element index
+            const submitIndex = action.elementIndex ?? null;
+            if (submitIndex != null) {
+              try {
+                broadcastEvent({ type: "EXECUTING", tabId, action: { type: "click", index: submitIndex }, elementName: "Submit form" });
+                await executeCdpAction(tabId, { type: "click", index: submitIndex }, elementMap);
+                await sleep(NAVIGATE_SETTLE_MS);
+                broadcastEvent({ type: "ACTION_VERIFIED", tabId, action, observation: "Form submitted" });
+                completedActions.push(`Clicked submit button [${submitIndex}] — form submitted`);
+                lastThought = "Form submitted successfully.";
+              } catch (e) {
+                console.warn("BG: Immediate submit click failed:", e.message);
+                completedActions.push("User confirmed submit — now click the submit button");
+                lastThought = "User confirmed. Click the submit/apply button now.";
+              }
+            } else {
+              completedActions.push("User confirmed submit — now click the submit button");
+              lastThought = "User confirmed. Click the submit/apply button now. Do NOT ask again.";
+            }
+            continue;
+          }
+
+          // 3. For subjective/creative fields: draft polished content from raw notes
+          if (isSubjective) {
+            broadcastEvent({ type: "THOUGHT", tabId, thought: `Drafting polished content for "${fieldKey}" from user notes...` });
+            answer = await draftSubjectiveContent(answer, question);
+            broadcastEvent({ type: "ACTION_VERIFIED", tabId, action, observation: `Drafted content for "${fieldKey}"` });
+          }
+
+          // 4. Save to profile so future forms can reuse it
+          try { await saveProfileFields({ [fieldKey]: answer }); } catch {}
+          completedActions.push(`User provided [${fieldKey}]: "${answer.slice(0, 60)}"`);
+        }
+
+        // 5. Store answer so vision model sees it next round
+        extractedData[`answer_${fieldKey}`] = answer;
+
+        // 6. If model supplied the element index, type immediately — skips a full vision round
+        const typeIndex = action.elementIndex ?? null;
+        if (typeIndex != null && fieldKey !== "submit_confirm") {
+          try {
+            broadcastEvent({ type: "EXECUTING", tabId, action: { type: "type", index: typeIndex, value: answer }, elementName: `Fill "${fieldKey}"` });
+            await executeCdpAction(tabId, { type: "type", index: typeIndex, value: answer }, elementMap);
+            await sleep(SETTLE_MS);
+            broadcastEvent({ type: "ACTION_VERIFIED", tabId, action, observation: `Typed value for "${fieldKey}"` });
+            completedActions.push(`Typed "${answer.slice(0, 60)}" into element [${typeIndex}]`);
+            lastThought = `Successfully filled "${fieldKey}". Continue with the next unfilled field or scroll to find more.`;
+          } catch (e) {
+            console.warn("BG: Immediate type after ask_user failed:", e.message);
+            lastThought = `Got value for "${fieldKey}": "${answer.slice(0, 120)}". Now find the corresponding form field and type this value into it.`;
+          }
+        } else {
+          lastThought = `Got value for "${fieldKey}": "${answer.slice(0, 120)}". Now find the corresponding form field and type this value into it immediately.`;
+        }
+        continue;
+      }
 
       // Permission check for sensitive actions
       if (SENSITIVE_ACTIONS.has(action.type)) {
@@ -1831,8 +2070,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message.type === "FIELD_ANSWER_TEXT") {
+    if (pendingFieldQuestion) {
+      const { fieldKey, resolve } = pendingFieldQuestion;
+      pendingFieldQuestion = null;
+      const answer = message.text?.trim() || "";
+      broadcastEvent({ type: "FIELD_ANSWERED", fieldKey, answer });
+      resolve(answer || null);
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
   if (message.type === "ABORT_TASK") {
     pendingTask = null;
+    if (pendingFieldQuestion) {
+      const { resolve } = pendingFieldQuestion;
+      pendingFieldQuestion = null;
+      resolve(null);
+    }
     isTaskRunning = false;
     abortController?.abort();
     broadcastEvent({ type: "TASK_ABORTED" });
