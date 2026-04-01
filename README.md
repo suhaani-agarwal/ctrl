@@ -1,453 +1,283 @@
-### ctrl – Your autonomous AI copilot for the browser
+# ctrl — The AI that's smart enough to use AI
 
-Ctrl is a Chrome extension that puts a fully autonomous AI agent right inside your browser — one that sees what you see, hears what you say, and acts on your behalf in real time.
-You pick your avatar. You give it a name if you want. And then it's just... there. Always listening, always ready, never in the way unless you need it.
+> A Chrome extension that doesn't just automate your browser — it knows which AI tool is fastest for each job and uses it for you.
 
 ---
-### Why ctrl?
 
-Here’s what makes **ctrl** different from anything else:
-- **Live, interruptible conversation**  
-  Powered by Gemini Live, your agent talks with you, not at you. Mid‑sentence? Change your mind? Just say so. It adapts instantly without losing context.
-- **Screen awareness (on your terms)**  
-  You decide exactly which parts of your screen the agent can see. It uses that live context (DOM + screenshots + focused app) to understand what’s in front of you without overstepping your boundaries.
-- **Real browser actions**  
-  It doesn't just suggest. It does. Open tabs, fill forms, navigate pages, click buttons, edit documents, trigger UI workflows — **ctrl executes actions directly in your browser**.
-- **Multi‑agent delegation**  
-  Under the hood, a planner agent breaks your request into tasks and delegates them to specialized sub‑agents. One might draft content, another formats a slide, another searches the web — all in parallel, all coordinated.
-- **End‑to‑end workflows**  
-  Ask ctrl to *“build me a presentation on climate tech”* and it will:
-  - Open Google Slides.
-  - Create a new deck with a title and outline.
-  - Research and draft per‑slide content.
-  - Lay out and format the slides.
-  - Iterate on structure and style with you — all inside your existing browser tab.
+## The Problem
+
+Every browser AI agent today — Claude for Chrome, OpenAI Operator, Manus, Do Browser — tries to do everything by itself. Want a presentation? The agent clicks through Google Slides one button at a time. Want to compare prices? It opens tabs sequentially and slowly reads each page. Want a background removed from an image? It tries to navigate Photoshop or Canva's complex UI.
+
+**This approach is fundamentally broken.** LLMs are bad at navigating web pages. The best browser agent in the world scores only 10.4% on complex end-to-end workflows (CUB benchmark). Claude for Chrome's own developer community admits that "the information density of a web page is an order of magnitude lower than code or documents — where LLMs actually shine."
+
+The result: agents that are slow, expensive, inaccurate, and frustrating.
+
+## The Solution
+
+**ctrl doesn't try to be the AI. It orchestrates AIs.**
+
+When you say "make me a presentation," ctrl doesn't click through Slides for 10 minutes. It opens [Gamma](https://gamma.app), writes the perfect prompt, and gets a professional deck in 30 seconds.
+
+When you say "remove this background," it doesn't navigate Canva. It opens [remove.bg](https://remove.bg) and does it in 5 seconds.
+
+When you say "research this topic," it doesn't Google and click links one by one. It opens [Perplexity](https://perplexity.ai) and gets a cited summary in 10 seconds.
+
+When you say "fill this form," it doesn't need an external tool — it reads the form fields directly, matches them against your saved profile, asks you for anything missing, and fills everything in seconds.
+
+**ctrl knows 12+ specialized skills, each using the fastest possible method — whether that's a purpose-built AI tool or direct browser automation. You just talk, and it figures out the rest.**
+
 ---
-## High‑level capabilities
-- **Voice‑first control**
-  - Wake phrase or mic button to start.
-  - Full duplex voice: you speak, it speaks back, while acting in parallel.
-  - Interruptible at any time — just talk over it.
-- **Agentic loop over your screen**
-  - Repeated cycle of: *observe → plan → act → observe → refine*.
-  - Uses DOM previews, accessibility tree and visual screenshots.
-  - Robust selector heuristics (including `N1`, `N2` DOM indexing) to hit the right element.
-- **Real actions, not just suggestions**
-  - Click buttons, links, icons.
-  - Fill and submit forms.
-  - Scroll / scrollTo specific sections.
-  - Navigate to URLs or app routes.
-  - Interact with rich apps: Slides, Docs, Notion, dashboards, SaaS tools, etc.
-- **Planner + worker agents**
-  - A **planner** decomposes your request into steps and monitors progress.
-  - **Worker agents** handle:
-    - Web search and knowledge lookup.
-    - Text generation and rewriting.
-    - UI interaction and navigation.
-    - Domain‑specific tasks (e.g., slide design, copywriting, email drafting).
-  - The planner coordinates them and decides when the whole workflow is “done”.
-- **Safety & control**
-  - Permission prompts before sensitive actions (fills, destructive operations).
-  - Configurable visibility (which tabs, which windows, which sites).
-  - Clear visual indicators when the agent is “looking” at the page or listening.
----
-## Architecture
-At a high level, ctrl is made of:
-- **Chrome extension (frontline runtime)**  
-  - Side panel UI + overlay components.
-  - Background service worker.
-  - Content scripts injected into pages.
-  - Offscreen document for low‑latency microphone access.
-- **Agent runtime (hosted on Gemini)**
-  - Gemini Live session for realtime conversation.
-  - Planner & worker agents implemented via prompt‑orchestration and tools.
-  - Tools for:
-    - Browser actions (via extension messages).
-    - Web search / retrieval.
-    - Content generation and formatting.
-- **Optional native host**
-  - Chrome Native Messaging host for OS‑level tasks (window focus, app launching, etc).
 
-### Data-flow / architecture diagram
+## How It Works
 
-```mermaid
-flowchart LR
-
-  subgraph Browser["Chrome + ctrl Extension"]
-    SP["Side Panel UI (voice + status + preview)"]
-    BG["Background Service Worker (background.js)"]
-    CS["Content Script(s) (content.js, overlays)"]
-    OFF["Offscreen Doc (mic capture)"]
-    PAGE["Active Tab (Web App / Site)"]
-  end
-
-  subgraph Gemini["Gemini Agent Runtime"]
-    LIVE["Gemini Live (conversational loop)"]
-    PLAN["Planner Agent"]
-    W1["UI Worker (browser-action tool)"]
-    W2["Content Worker (copy, text, slides)"]
-    W3["Search / Tools (web + APIs)"]
-  end
-
-  subgraph OS["Host OS"]
-    NH["Native Host (optional)"]
-  end
-
-  %% Browser internals
-  SP <--> BG
-  BG <--> CS
-  BG <--> OFF
-  CS <--> PAGE
-
-  %% Live conversation
-  OFF -->|audio chunks| BG
-  BG -->|bidi websocket| LIVE
-  LIVE -->|text + audio| BG
-  BG -->|server messages| SP
-
-  %% Planner and workers
-  LIVE <--> PLAN
-  PLAN <--> W1
-  PLAN <--> W2
-  PLAN <--> W3
-
-  %% Browser action tool
-  W1 -->|"click/fill/scroll/navigate"| BG
-  BG -->|EXECUTE / PREVIEW| CS
-  CS -->|actions| PAGE
-  CS -->|DOM snapshot + state| BG
-  BG -->|page context| LIVE
-
-  %% Native host
-  PLAN --> NH
-  NH --> BG
+```
+You speak (or type)
+  → Gemini Live transcribes + understands intent in real-time
+  → Orchestrator picks the right skill for the job
+  → Skill executes using the fastest method:
+      • External AI tool (Gamma, Perplexity, remove.bg, etc.)
+      • Direct browser automation (forms, navigation, clicks)
+      • Parallel tab operations (price comparison, research)
+  → Agent narrates progress via voice as you watch it work
+  → Result presented — you approve, correct, or move on
 ```
 
---- 
+The agentic loop for each skill runs up to 25 rounds per step:
 
-## Conceptually
+```
+observe (DOM + accessibility tree + screenshot)
+  → plan next action (via LLM)
+  → execute action (via Chrome DevTools Protocol)
+  → verify result (screenshot → vision model)
+  → repeat until step is complete
+```
 
-You speak → microphone audio goes through the extension into Gemini Live.  
-Gemini Live + the planner parses intent and maintains the conversation.  
-Planner delegates sub-tasks to worker agents (UI, content, search).  
-UI worker uses the browser-action tool, which routes back into the extension.  
-Extension captures DOM + screenshots, executes actions, and returns updated state.  
-Planner monitors progress and decides when the workflow is complete.
+### Why This Is More Accurate Than Other Agents
+
+ctrl uses the **same approach as Claude for Chrome** for browser understanding — the Accessibility Tree (AX tree), not raw DOM or screenshots:
+
+- **AX tree = ~800 tokens per page** vs 10,000+ for full DOM. 12x cheaper, 12x more accurate.
+- **Chrome DevTools Protocol (CDP)** for action execution — native mouse/keyboard events that work on React apps, SPAs, and every modern web app.
+- **Screenshot verification after every action** — a vision model confirms the action worked before proceeding.
+- **Shared login state** — works with your existing sessions. No re-authentication needed.
+
+But unlike Claude for Chrome, ctrl doesn't try to do complex creative tasks via raw DOM clicks. It **delegates to the right tool** and achieves in 30 seconds what other agents fail to do in 10 minutes.
 
 ---
 
-# Repository layout (high-level)
+## Features
 
-Names may differ slightly depending on your copy of the repo, but the roles are consistent.
+### Voice-First Control
+- Powered by **Gemini Live** — full duplex, real-time, interruptible voice conversation.
+- Speak in Hindi, English, or Hinglish. Change your mind mid-sentence. The agent adapts.
+- Text input also available in the side panel.
+
+### Smart Tool Delegation
+- 12+ built-in skills, each using the optimal method for its task type.
+- Automatically routes your request to the right skill — you never need to specify which tool to use.
+- Community skills can be installed directly from the side panel.
+
+### Real Browser Actions
+- Opens tabs, fills forms, clicks buttons, scrolls, navigates — all via CDP.
+- Parallel tab operations for tasks like price comparison.
+- Works with your existing logins (Gmail, Amazon, Notion — anything you're signed into).
+
+### User Profile Memory
+- Save your name, email, phone, address, and other details once.
+- ctrl uses this to auto-fill forms without asking every time.
+- Missing fields are requested interactively via voice — then saved for next time.
+
+### Safety & Control
+- **Permission modes**: strict (ask before every action), smart (ask for sensitive actions only), or auto (full autonomy for trusted sites).
+- **Abort button** stops any running task immediately.
+- **Submit confirmation** required before any form is submitted.
+
+---
+
+## Skills
+
+Each skill is a self-contained module that handles a specific type of task. Skills can use external AI tools, direct browser automation, or a combination.
+
+| Skill | What It Does | Method |
+|-------|-------------|--------|
+| `ppt-gamma` | Creates presentations via Gamma.app | External AI tool |
+| `design-stitch` | Designs landing pages and UI via Stitch | External AI tool |
+| `research-perplexity` | Deep research with citations via Perplexity | External AI tool |
+| `youtube-summarize` | Summarizes the current YouTube video | Transcript extraction + LLM |
+| `price-compare` | Compares prices across shopping sites | Parallel tabs + AX tree |
+| `shopping` | Searches and browses products on any site | Direct browser automation |
+| `booking` | Books restaurants, hotels, flights | Direct browser automation |
+| `email` | Drafts, reads, and sends emails in Gmail | Direct browser automation |
+| `media` | Plays music, podcasts, videos | Direct browser automation |
+| `research` | In-page scraping and summarization | AX tree + LLM |
+| `tab-manager` | Opens, closes, and switches tabs | Chrome APIs |
+| `form-fill` | Fills any web form using saved profile + voice Q&A | Direct browser automation |
+
+### Adding a New Skill
+
+Skills are modular. To add a new skill:
+
+1. Create a new file in `extension/skills/` (e.g., `my-skill.js`)
+2. Export an object with `name`, `description`, `triggers`, `canHandle()`, and `execute()`
+3. Register it in `extension/skills/index.js`
+
+Community skills can also be installed at runtime via URL from the side panel.
+
+---
+
+## Architecture
 
 ```
 extension/
-  manifest.json        – Chrome extension manifest (Manifest V3).
-  background.js        – service worker, WebSocket, message router, content-script injector, offscreen manager.
-  sidepanel.html / sidepanel.js – side panel UI, transcript, agentic loop driver.
-  content.js           – DOM preview, action execution, permission banners, overlays.
-  offscreen.html / offscreen.js – microphone capture and audio streaming.
-  assets               – icons, avatar images, CSS, etc.
-
-native/ (optional)
-  Native messaging host implementation (com.ctrl.ai_agent_host).
-
-README.md
-LICENSE
+  manifest.json            Chrome MV3 manifest
+  background.js            Service worker — orchestrator, skill router, CDP, API calls
+  sidepanel.html/.js       Side panel UI — voice controls, status, settings, skills manager
+  content.js               Content script — DOM snapshots, action execution, permission banners
+  offscreen.html/.js       Offscreen document — microphone capture, PCM16 streaming
+  audio-processor.js       AudioWorklet — float32 → PCM16 conversion
+  audio-capture.js         Mic capture bootstrap
+  skills/
+    index.js               Skill registry (built-in + community)
+    form-fill.js           Generic form-fill skill
+    ppt-gamma.js           Presentation skill (via Gamma)
+    design-stitch.js       Design skill (via Stitch)
+    youtube-summarize.js   YouTube summarization skill
+    research-perplexity.js Deep research skill (via Perplexity)
+    research.js            In-page research skill
+    price-compare.js       Price comparison skill
+    shopping.js            Shopping skill
+    booking.js             Booking skill
+    email.js               Email skill
+    media.js               Media playback skill
+    tab-manager.js         Tab management skill
+  storage/
+    user-profile.js        User profile CRUD helpers
 ```
 
+### Data Flow
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Chrome + ctrl Extension                 │
+│                                                           │
+│  ┌─────────────┐  ┌────────────────┐  ┌──────────────┐  │
+│  │  Side Panel  │  │   Background   │  │   Content    │  │
+│  │  (voice UI,  │◄►│  (orchestrator │◄►│   Script     │  │
+│  │   settings)  │  │   skill router │  │  (DOM + acts)│  │
+│  └─────────────┘  │   CDP control) │  └──────┬───────┘  │
+│                    └───────┬────────┘         │          │
+│  ┌─────────────┐          │           ┌──────▼───────┐  │
+│  │  Offscreen   │──audio──►│           │  Active Tab  │  │
+│  │  (mic input) │          │           │  (your page) │  │
+│  └─────────────┘          │           └──────────────┘  │
+│                            │                             │
+└────────────────────────────┼─────────────────────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+      ┌───────▼──────┐ ┌────▼─────┐ ┌──────▼───────┐
+      │ Gemini Live  │ │  Groq    │ │  OpenRouter  │
+      │ (voice +     │ │ (intent  │ │  (action     │
+      │  intent)     │ │  routing │ │   planning)  │
+      └──────────────┘ │  + draft)│ └──────────────┘
+                       └──────────┘
+```
+
+### Models
+
+| Role | Model | Via |
+|------|-------|----|
+| Voice conversation + intent detection | `gemini-2.5-flash-native-audio` | Gemini Live WebSocket |
+| Orchestration + content drafting | `llama-4-scout` / `llama-4-maverick` | Groq REST API |
+| Per-round action planning | Configurable (default: best available) | OpenRouter REST API |
+| Screenshot verification | `llama-4-scout` (multimodal) | Groq REST API |
+
 ---
 
-# Running ctrl locally (extension only)
+## Setup
 
-## 1. Prerequisites
+### Prerequisites
 
-Chrome (or Chromium-based browser) with:
+- Chrome (or Chromium) with Side Panel API support
+- **Gemini API key** — [aistudio.google.com](https://aistudio.google.com)
+- **Groq API key** — [groq.com](https://groq.com)
+- **OpenRouter API key** — [openrouter.ai](https://openrouter.ai)
 
-- Extension support
-- Side panel API
-- Offscreen documents (`chrome.offscreen`)
-
-A Gemini API key with access to:
-
-- `models/gemini-2.5-flash-native-audio-latest` (for Live)
-- `models/gemini-2.5-flash` or similar for fast JSON / planning calls
-
-Node.js and npm if you want to run build tooling (optional but recommended).
-
----
-
-## 2. Clone the repository
+### Install
 
 ```bash
-git clone https://github.com/<your-org-or-user>/ctrl.git
+git clone https://github.com/<your-org>/ctrl.git
 cd ctrl
 ```
 
----
+There is **no build step**. The extension loads directly.
 
-## 3. Install dependencies (if the project uses a build step)
+1. Open `chrome://extensions`
+2. Enable **Developer mode**
+3. Click **Load unpacked** → select the `extension/` folder
+4. Click the ctrl icon to open the side panel
 
-If the extension files are already built JS, you can skip this.
+### Configure
 
-Otherwise:
-
-```bash
-npm install
-npm run build   # or whatever build script the project defines
-```
-
-This should produce or update the JS bundle(s) in the `extension/` directory.
-
----
-
-## 4. Load the extension into Chrome
-
-1. Open `chrome://extensions`.
-2. Enable **Developer mode** (toggle in the top-right).
-3. Click **Load unpacked**.
-4. Select the `extension/` folder inside this repo.
-5. Verify the extension appears with no manifest errors.
+Open ctrl's side panel → **Settings**:
+1. Enter your Gemini, Groq, and OpenRouter API keys
+2. The status indicator turns green when Gemini Live connects
+3. (Optional) Fill in your user profile for automatic form filling
 
 ---
 
-## 5. Configure Gemini
+## Usage
 
-Click the extension icon or open the side panel (depending on your setup).
+Just talk to it:
 
-In the side panel:
-
-- Paste your Gemini API key into the API key field.
-- The status should show **“Connecting…”** and then **“Ready — press mic to talk”**.
-
-Optionally, open the DevTools console for:
-
-- the **background service worker** (`background.js`)
-- the **side panel** (`sidepanel.js`)
-
----
-
-# Testing ctrl locally – step-by-step
-
-Below is a simple but thorough test plan you can follow locally.
+| What you say | What ctrl does |
+|-------------|---------------|
+| "Make a 10-slide presentation on climate change" | Opens Gamma → writes prompt → generates deck → asks for corrections |
+| "Compare iPhone 16 prices on Amazon and Flipkart" | Opens both sites in parallel → extracts prices → tells you the best deal |
+| "Fill out this job application" | Reads form fields → fills from your profile → asks for missing info → fills the rest |
+| "Summarize this YouTube video" | Extracts transcript → summarizes via LLM → reads summary aloud |
+| "Research the best laptops under 80000" | Opens Perplexity → writes query → reads cited results |
+| "Remove the background from this image" | Opens remove.bg → uploads → downloads clean result |
+| "Book a table for 2 at an Italian place in Delhi" | Searches restaurants → navigates booking flow → confirms with you |
+| "Draft a follow-up email to the last meeting" | Opens Gmail → drafts email based on context → waits for your approval |
 
 ---
 
-## A. Smoke test: voice + conversation
+## Security & Privacy
 
-Open any regular web page (e.g. https://example.com).
+ctrl captures microphone audio **only when the mic button is active**. It captures DOM snapshots and screenshots **only for the active tab during task execution**. All data is sent over HTTPS to Gemini, Groq, and OpenRouter.
 
-Open the ctrl side panel.
-
-Press the mic button.
-
-Say something like:
-
-> “Hey ctrl, can you hear me?”
-
-Expected:
-
-- You see your speech transcribed (if transcriptions are surfaced).
-- The agent responds with audio.
-- No browser actions yet, just conversation.
+ctrl does **not**:
+- Inspect tabs you're not actively working in
+- Submit forms without your explicit confirmation
+- Store audio or screenshots beyond the current session
+- Send data to any servers other than the configured AI APIs
 
 ---
 
-## B. Screen awareness + DOM preview
+## Contributing
 
-With the same page open, press the mic and say:
+### Adding a skill
 
-> “Look at this page and tell me what main actions you see.”
+1. Create `extension/skills/your-skill.js`
+2. Follow the pattern from existing skills (see `form-fill.js` as a template)
+3. Register in `extension/skills/index.js`
+4. Submit a PR
 
-Expected:
+### Reporting issues
 
-- Side panel shows a DOM preview list (`N1`, `N2`, …) for interactive elements.
-- You may see a screenshot thumbnail.
-- The agent describes buttons/links and may propose actions.
-
----
-
-## C. Real browser actions (click + scroll)
-
-Browse to a page with obvious buttons (YouTube, docs, a dashboard, etc.).
-
-With ctrl open, say:
-
-> “Scroll down a bit.”  
-> “Now click the Subscribe button.”
-
-or
-
-> “Click N7.” (if N7 is the Subscribe button in the DOM preview)
-
-Expected:
-
-- The page scrolls down.
-- Ctrl triggers a click on the target button.
-- Side panel logs show the inferred or parsed action and its success.
-- A new screenshot reflects the post-click state.
+Open an issue with:
+- What you said (voice command)
+- What happened vs what you expected
+- The site you were on (if relevant)
+- Console errors (if any)
 
 ---
 
-## D. Form-filling and search
+## License
 
-Go to a search site (Google, YouTube, internal search).
-
-Say:
-
-> “Search for ‘autonomous browser agents’.”
-
-Expected:
-
-- Ctrl identifies a text input.
-- Prompts for permission if the action is sensitive.
-- Types the query and submits (`ENTER` or search button).
-- Opens results and captures the updated page.
+MIT
 
 ---
 
-## E. End-to-end workflow (Slides example)
-
-Open **Google Slides** and create (or open) a presentation.
-
-Say:
-
-> “Create a 5-slide presentation on climate tech with a title slide, overview, three content slides, and a conclusion.”
-
-Expected behavior (at a high level):
-
-Planner breaks this into steps:
-
-- Ensure you’re in Slides / new deck.
-- Generate an outline and slide titles.
-- Create/duplicate slides as needed.
-- Populate content fields via text workers.
-
-UI worker navigates within Slides to:
-
-- Insert/duplicate slides.
-- Select and edit title and body text boxes.
-
-Agent keeps you in the loop verbally:
-
-> “I’ve created the outline, now I’m adding the first content slide…”
-
-When done, it summarizes:
-
-> “All set — I built a 5-slide climate tech deck with structured content.”
-
-You can experiment with similar workflows in **Docs, Notion, Trello, Jira, etc.**
-
----
-
-## Real-world use cases
-
-### 1. Hands-free form filling (accessibility & comfort)
-
-Imagine you’re injured, can’t type easily, or simply want to lean back and talk instead of pecking at fields.
-
-- You open a long signup or application form in your browser.
-- You launch ctrl and say:
-
-  > “Help me fill this form. My name is Alex Chen, I live in San Francisco, I work as a product manager, and I’m applying for the remote role.”
-
-- Ctrl:
-  - Scans the visible form fields and DOM structure.
-  - Asks clarifying questions when needed:
-
-    > “Is your preferred email the one already autofilled, or should I use another?”  
-    > “For ‘experience level’, should I select Mid, Senior, or Lead?”
-
-  - Fills fields intelligently, section by section, reading back critical fields before submitting.
-  - Waits for your explicit confirmation before pressing **Submit**.
-
-This is especially powerful if you have limited mobility, are multitasking, or just prefer to dictate instead of typing.
-
-### 2. Voice-driven research and web flows
-
-- “Compare the pricing of these three SaaS tools and summarize the differences in a bullet list in Notion.”  
-- “Log in to my analytics dashboard, apply last-month filters, and tell me which channel had the highest growth.”  
-- “Open my email, draft a follow-up to the last message from Sarah summarizing today’s meeting.”
-
-Ctrl combines:
-
-- Live exploration of pages via DOM + screenshots.
-- Planner + workers to:
-  - Navigate between tabs and apps.
-  - Extract and summarize information.
-  - Populate other tools (docs, notes, email, tickets) on your behalf.
-
-### 3. Presentation building and iteration (Google Slides, etc.)
-
-Ctrl doesn’t just “help with slides” — it can drive the whole workflow end-to-end:
-
-- You say:
-
-  > “Create a 10-slide presentation on ‘AI safety for product teams’ with:  
-  > 1) a title slide, 2) agenda, 3–8) content slides with examples, 9) risks & mitigations, 10) next steps.”
-
-- Ctrl:
-  - Opens Google Slides in your browser.
-  - Creates a new deck, sets up the outline, and titles each slide.
-  - Drafts content for each slide using your tone and target audience.
-  - Asks you questions along the way:
-
-    > “Do you prefer a more technical or non-technical audience?”  
-    > “Should I include code snippets, diagrams, or keep it high-level?”
-
-  - Refines structure, wording, and visual emphasis as you give feedback:
-
-    > “Make slide 3 more concise and slide 5 more example-heavy.”  
-    > “Add a final call-to-action slide for stakeholders.”
-
-All of this happens **in your browser**, on your existing Slides tab, with ctrl clicking, typing, and navigating on your behalf.
-
-### 4. Everyday “copilot” tasks
-
-Some other patterns ctrl is designed for:
-
-- **Inbox triage**: skim emails, summarize threads, and draft replies.
-- **Task board wrangling**: move cards, update statuses, leave comments in tools like Trello/Jira/Linear.
-- **Knowledge digging**: open multiple sources, read and summarize, and then synthesize into a doc or note.
-- **Scheduling flows**: open your calendar, propose time slots, and draft scheduling emails or messages.
-
-In all of these, ctrl:
-
-- Maintains a live conversational loop with you.
-- Acts directly in your browser.
-- Delegates sub-tasks to specialized workers under the hood.
-
----
-
-## Policy & safety layers
-
-- Domain-specific allow/deny rules for actions.
-- Site-level visibility rules  
-  (e.g., **no DOM capture on banking sites**).
-- Extra confirmation for destructive flows  
-  (**delete, submit, publish**).
-
----
-
-# Security & privacy
-
-ctrl:
-
-- Captures microphone audio **only when the mic is on**.
-- Captures **DOM snapshots and screenshots for the active tab only** when needed for tasks.
-- Sends this data to **Gemini over HTTPS** for processing and action planning.
-
-It does **not**:
-
-- Automatically inspect every tab/window.
-- Perform actions without going through its permission and planning layers.
-
-You should review and adapt the privacy model to your own threat model and policies before distributing ctrl broadly.
-
-For example:
-
-- add **site allowlists**
-- more **granular permissions**
-- additional **user-visible controls**
-
----
+**ctrl** — Stop clicking. Start talking.
