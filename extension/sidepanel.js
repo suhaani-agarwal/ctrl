@@ -450,7 +450,7 @@ function handleAgentEvent(event) {
 
     case "TASK_COMPLETE":
       setStatus("listening");
-      if (event.summary) appendTranscript("agent", event.summary);
+      if (event.summary) appendTranscript("agent", event.summary, event.formatted);
       resetTaskUI();
       break;
 
@@ -564,10 +564,18 @@ function resetTaskUI() {
   setStatus(isListening ? "listening" : "idle");
 }
 
-function appendTranscript(role, text) {
+function appendTranscript(role, text, formatted = false) {
   const div = document.createElement("div");
   div.className = `bubble ${role}`;
-  div.textContent = text;
+  if (formatted) {
+    // Render **bold**, bullet points (•), and line breaks
+    div.innerHTML = text
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/\n/g, "<br>");
+  } else {
+    div.textContent = text;
+  }
   transcript.appendChild(div);
   transcript.scrollTop = transcript.scrollHeight;
 }

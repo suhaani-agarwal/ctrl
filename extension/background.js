@@ -778,7 +778,7 @@ async function executeCdpAction(tabId, action, elementMap) {
       } else {
         throw new Error("type action missing index and x,y");
       }
-      await sleep(120);
+      await sleep(200); // longer settle for focus, especially on custom/shadow-DOM inputs
 
       // Select-all + delete to clear if requested
       if (action.clear) {
@@ -802,26 +802,44 @@ async function executeCdpAction(tabId, action, elementMap) {
       await sleep(50);
 
       // Fire React/Vue synthetic events so controlled inputs pick up the new value.
-      // For regular <input>/<textarea>: use nativeInputValueSetter to bypass React's read-only value.
-      // For contenteditable divs (Perplexity, Notion, etc.): dispatch input event directly.
+      // For index-based: use backendNodeId. For coordinate-based: target document.activeElement.
       try {
-        const el = elementMap.get(Number(action.index ?? action.elementIndex));
-        if (el?.backendNodeId) {
-          const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: el.backendNodeId });
+        const indexedEl = elementMap.get(Number(action.index ?? action.elementIndex));
+        if (indexedEl?.backendNodeId) {
+          const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: indexedEl.backendNodeId });
           await cdp(tabId, "Runtime.callFunctionOn", {
             objectId: object.objectId,
             functionDeclaration: `function(val) {
-              // React controlled input: override via native setter
               const inputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement?.prototype, 'value')?.set;
               const textareaSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement?.prototype, 'value')?.set;
               const setter = this.tagName === 'TEXTAREA' ? textareaSetter : inputSetter;
               if (setter) setter.call(this, val);
-              // Fire events React listens to
               this.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
               this.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
             }`,
             arguments: [{ value: action.value }],
             silent: true
+          });
+        } else {
+          // Coordinate-based: fire events on whatever element currently has focus
+          await cdp(tabId, "Runtime.evaluate", {
+            expression: `(function(val) {
+              const el = document.activeElement;
+              if (!el || el === document.body) return;
+              try {
+                if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+                  const s = Object.getOwnPropertyDescriptor(
+                    el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set;
+                  if (s) s.call(el, val);
+                } else if (el.isContentEditable) {
+                  // contenteditable (Stitch, Notion, etc.)
+                  el.textContent = val;
+                }
+              } catch(e) {}
+              el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            })(${JSON.stringify(action.value)})`,
+            returnByValue: false
           });
         }
       } catch { /* non-critical */ }
@@ -856,10 +874,36 @@ async function executeCdpAction(tabId, action, elementMap) {
         ArrowRight: { code: "ArrowRight", windowsVirtualKeyCode: 39 },
         Backspace:  { code: "Backspace",  windowsVirtualKeyCode: 8  },
       };
+      // If an element index is provided, refocus it before sending the key.
+      // Use a physical click (not just DOM.focus) to dismiss any autocomplete dropdown
+      // that may have stolen focus, then soft-focus to ensure keyboard routing is correct.
+      const keypressIdx = action.index ?? action.elementIndex;
+      if (keypressIdx != null) {
+        const el = elementMap.get(Number(keypressIdx));
+        if (el?.backendNodeId) {
+          try { await cdpClickElement(tabId, el.backendNodeId); } catch {}
+          await sleep(80);
+          try { await cdp(tabId, "DOM.focus", { backendNodeId: el.backendNodeId }); } catch {}
+          await sleep(50);
+        }
+      } else if (action.x != null && action.y != null) {
+        // Coordinate-based refocus before sending key
+        await cdpClick(tabId, action.x, action.y);
+        await sleep(100);
+      }
       const keyInfo = KEY_CODES[action.key] || { code: action.key, windowsVirtualKeyCode: 0 };
-      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: action.key, ...keyInfo });
+      // Include text/unmodifiedText for Enter so form-submission handlers fire correctly
+      const extraKeyFields = action.key === "Enter" ? { text: "\r", unmodifiedText: "\r" } : {};
+      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: action.key, ...keyInfo, ...extraKeyFields });
       await sleep(30);
       await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp",   key: action.key, ...keyInfo });
+      // For Enter on coordinate-based targets: also fire via JS on activeElement (handles custom submit handlers)
+      if (action.key === "Enter" && keypressIdx == null) {
+        await cdp(tabId, "Runtime.evaluate", {
+          expression: `document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}))`,
+          returnByValue: false
+        }).catch(() => {});
+      }
       break;
     }
 
@@ -1133,6 +1177,7 @@ Clarification rules — DEFAULT is clarificationNeeded=false. ONLY set true when
 - NEVER ask for tasks that mention a specific URL or search query
 - When in doubt: clarificationNeeded=false and just attempt the task
 
+
 planSummary rules:
 - Keep it one short sentence: "I'll [action] on [site]."
 - Do NOT ask questions in planSummary — it's a statement, not a question
@@ -1140,7 +1185,8 @@ planSummary rules:
 AI TOOL ROUTING — for these tasks, ALWAYS prefer the specialized skill listed:
 - "presentation", "slides", "deck", "ppt", "pitch deck", "slideshow" → skill: ppt-gamma
 - "research", "deep search", "look up", "find information about", "learn about" → skill: research-perplexity
-- "compare prices", "cheapest", "best price", "best deal", "how much does X cost" → skill: price-compare
+- "compare prices", "cheapest", "best price", "best deal", "how much does X cost", "find a cheaper" → skill: price-compare, taskType: multi-tab-parallel. For parallelSubtasks: if the user explicitly names specific sites (e.g. "Amazon or Flipkart", "on Amazon and Myntra"), use ONLY those sites. Otherwise default to Amazon India (amazon.in), Flipkart, and the most relevant third site for the category (electronics→croma.com, furniture/home→ikea.com/in, fashion→myntra.com). Each subGoal must say "find the CHEAPEST matching product and extract its price and title from search results".
+- "buy", "shop", "find on amazon", "search on flipkart", "find on ikea", "find similar", "find something like this", "add to cart", "order this", "find this product" → skill: shopping
 - "summarize video", "summarize this youtube", "what is this video about", "video summary" → skill: youtube-summarize
 - "design", "UI mockup", "landing page design", "app design", "interface" → skill: design-stitch
 - "fill this form", "apply", "sign up", "register", "checkout form" → skill: form-fill
@@ -1182,16 +1228,25 @@ OUTPUT — return exactly this JSON (no markdown, no extra keys):
   "actions": [...],
   "done": false
 }
+When using extract, fill the fields with ACTUAL VALUES you see on screen — not descriptions:
+  WRONG: {"type":"extract","fields":{"price":"price of the first result"}}
+  RIGHT: {"type":"extract","fields":{"price":"₹24,990","title":"STRANDMON Wing Chair","site":"IKEA","url":"https://www.ikea.com/..."}}
 
 ACTIONS:
 {"type":"navigate","url":"https://..."}                     ← navigate to URL
 {"type":"click","index":N}                                  ← click element N from CLICKABLE ELEMENTS list
 {"type":"type","index":N,"value":"text","clear":true}       ← focus element N and type
 {"type":"scroll","direction":"down","amount":400}            ← scroll page
-{"type":"keypress","key":"Enter"}                            ← sends key to last focused element
+{"type":"keypress","key":"Enter","index":N}                  ← sends key to element N (ALWAYS pass index for search bars — dropdowns steal focus)
 {"type":"wait","ms":2000}                                    ← wait (use for page loads, AI generation)
-{"type":"extract","fields":{"fieldName":"what to capture"}} ← record data visible on page
+{"type":"extract","fields":{"price":"₹24,990","title":"Product Name","site":"Amazon","url":"https://..."}} ← fill fields with ACTUAL VALUES you see — not descriptions
 {"type":"dismiss_popup"}                                     ← Escape + click away to close overlays
+{"type":"ask_user","fieldKey":"field_name","question":"What is your X?","elementIndex":N,"isSubjective":false} ← pause and ask user for a value you cannot determine; use when a form field's value is unknown and not visible on screen. fieldKey must be a short snake_case identifier (e.g. "first_name", "cover_letter"). Set elementIndex to the input's index so the answer is typed immediately. Set isSubjective=true for open-ended/creative fields (bio, cover letter, essay).
+
+FORM FILLING RULES:
+- For every form field whose value you do NOT know and cannot infer: output {"type":"ask_user",...} — do NOT guess or leave blank
+- Profile data (name, email, phone, address, etc.) may already be stored — use ask_user anyway; the system will auto-fill from memory if available
+- Never invent personal data — always ask_user for any field whose value you are uncertain about
 
 HOW TO USE THE ELEMENT LIST:
 - Indices are 1-BASED: [1] is the first element. NEVER use [0] — it does not exist.
@@ -1199,6 +1254,7 @@ HOW TO USE THE ELEMENT LIST:
 - Use its NUMBER as the "index" value: {"type":"click","index":3}
 - For text inputs (Textbox, Searchbox, Combobox): use {"type":"type","index":N,"value":"text","clear":true} DIRECTLY — the type action handles focus automatically, do NOT click them first
 - NEVER click a Textbox or Searchbox — always use the type action on them
+- SEARCH BAR PATTERN: after typing into a search bar, ALWAYS submit with {"type":"keypress","key":"Enter","index":N} using the SAME index as the search bar — dropdowns steal focus and a bare Enter will not work
 - NEVER copy x,y coordinates into your actions — use the index number only
 - The (x:, y:) shown are for visual reference only
 
@@ -1220,7 +1276,7 @@ RULES:
 5. If a click has no effect, try a different element or approach — do NOT keep clicking the same thing
 6. Return ONLY the JSON object — no markdown, no extra text`;
 
-async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null) {
+async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null, referenceB64 = null) {
   console.log("BG: VisionActionAgent start — tab:", tabId, "goal:", goal, "skill:", skillName);
   const skill = skillName ? getSkill(skillName) : null;
   const systemPrompt = VISION_SYSTEM_PROMPT + (skill?.systemPromptAddition ? "\n\n" + skill.systemPromptAddition : "");
@@ -1237,8 +1293,29 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
   let lastClickedIdx = null;
   // Running log of completed actions — shown to the model each round so it doesn't backtrack
   const completedActions = [];
+  // Screenshot cache — reuse when last round's actions didn't change the DOM
+  const DOM_CHANGING_ACTIONS = new Set(["click", "navigate", "type", "keypress", "dismiss_popup", "scroll", "wait"]);
+  let cachedScreenshot = null;   // { annotatedB64, elementList, elementMap }
+  let prevActionsChangedDom = true; // force fresh screenshot on round 1
 
   broadcastEvent({ type: "AGENT_START", tabId, goal, skill: skillName });
+
+  // Initial context screenshot: use the caller-provided reference image (e.g. the original
+  // Pepperfry page for a price-compare sub-agent) if available; otherwise capture from own tab.
+  let initialContextB64 = referenceB64 || null;
+  if (!initialContextB64) {
+    try {
+      const currentTab = await chrome.tabs.get(tabId);
+      if (currentTab.url && !currentTab.url.startsWith("chrome://") && !currentTab.url.startsWith("about:")) {
+        ({ annotatedB64: initialContextB64 } = await buildAnnotatedScreenshot(tabId));
+        console.log("BG: Initial context screenshot captured");
+      }
+    } catch (e) {
+      console.warn("BG: initial context screenshot failed:", e.message);
+    }
+  } else {
+    console.log("BG: Using caller-provided reference screenshot as initial context");
+  }
 
   // If the skill requires a specific starting URL, navigate there NOW via CDP
   // before round 1. This is guaranteed — the LLM cannot skip it.
@@ -1269,16 +1346,23 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
     round++;
     broadcastEvent({ type: "PERCEIVING", tabId, round });
 
-    // Build annotated screenshot with CSS-pixel coordinates
-    console.log("BG: Building annotated screenshot, round", round);
-    let annotatedB64, elementList, elementMap;
-    try {
-      ({ annotatedB64, elementList, elementMap } = await buildAnnotatedScreenshot(tabId));
-      console.log("BG: Screenshot built, elements:", elementMap.size);
-    } catch (e) {
-      console.error("BG: screenshot failed", e);
-      await sleep(1000);
-      continue;
+    // Build annotated screenshot — skip if last round's actions were all non-DOM-changing
+    // (scroll, wait, extract don't change the page; reusing the screenshot saves ~500-800ms)
+    let annotatedB64, elementList, elementMap, vpW = 1280, vpH = 800;
+    if (prevActionsChangedDom || cachedScreenshot === null) {
+      console.log("BG: Building annotated screenshot, round", round);
+      try {
+        ({ annotatedB64, elementList, elementMap, vpW, vpH } = await buildAnnotatedScreenshot(tabId));
+        cachedScreenshot = { annotatedB64, elementList, elementMap, vpW, vpH };
+        console.log("BG: Screenshot built, elements:", elementMap.size);
+      } catch (e) {
+        console.error("BG: screenshot failed", e);
+        await sleep(1000);
+        continue;
+      }
+    } else {
+      console.log("BG: Reusing cached screenshot, round", round, "(no DOM-changing actions last round)");
+      ({ annotatedB64, elementList, elementMap, vpW, vpH } = cachedScreenshot);
     }
 
     // Get current tab URL and title for context
@@ -1290,11 +1374,28 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
     } catch { }
 
     // Build prompt — element list now includes exact (x, y) coordinates
-    const userContent = [
-      {
+    const userContent = [];
+
+    // For shopping/price-compare, keep the initial context screenshot visible through
+    // round 3 so the model can visually compare product images in search results.
+    const isVisualSkill = skillName === "shopping" || skillName === "price-compare" || skillName === "design-stitch";
+    if ((round === 1 || (isVisualSkill && round <= 3)) && initialContextB64) {
+      userContent.push({
+        type: "text",
+        text: "INITIAL SCREEN (what was on screen when the user made their request — analyze this to understand what product/item/content they are referring to before navigating):"
+      });
+      userContent.push({
         type: "image_url",
-        image_url: { url: `data:image/jpeg;base64,${annotatedB64}` }
-      },
+        image_url: { url: `data:image/jpeg;base64,${initialContextB64}` }
+      });
+      userContent.push({ type: "text", text: "CURRENT SCREEN (after any navigation):" });
+    }
+
+    userContent.push({
+      type: "image_url",
+      image_url: { url: `data:image/jpeg;base64,${annotatedB64}` }
+    });
+    userContent.push(
       {
         type: "text",
         text: [
@@ -1307,10 +1408,19 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
           lastThought ? `Previous thought: ${lastThought}` : "",
           "",
           "CLICKABLE ELEMENTS (indices are 1-based — [1] is first, never use [0]):",
-          elementList
+          elementList,
+          elementMap.size === 0 ? [
+            "",
+            "⚠ 0 ELEMENTS DETECTED — DOM inspector found nothing, but you may see UI in the screenshot.",
+            "Use COORDINATE-BASED actions. Viewport is " + vpW + "×" + vpH + " CSS px.",
+            '  Click:    {"type":"click","x":CX,"y":CY}',
+            '  Type:     {"type":"type","x":CX,"y":CY,"value":"your text","clear":true}',
+            '  Submit:   {"type":"keypress","key":"Enter","x":CX,"y":CY}',
+            "Look at the screenshot, estimate (x,y) of the element's center. Do NOT scroll or wait — act immediately.",
+          ].join("\n") : ""
         ].filter(Boolean).join("\n")
       }
-    ];
+    );
 
     // Call vision action model — Gemini 2.0 Flash (free, excellent at UI screenshots)
     console.log("BG: Calling vision model for action decision...");
@@ -1525,6 +1635,15 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
 
       broadcastEvent({ type: "ACTION_VERIFIED", tabId, action });
 
+      // Merge extract action fields directly into extractedData.
+      // The model fills action.fields with ACTUAL values it reads from the page.
+      // This is the primary mechanism for capturing prices, titles, URLs, etc.
+      if (action.type === "extract" && action.fields && typeof action.fields === "object") {
+        Object.assign(extractedData, action.fields);
+        console.log("BG: Extracted data from action.fields:", action.fields);
+        broadcastEvent({ type: "DATA_EXTRACTED", tabId, fields: action.fields });
+      }
+
       // Log meaningful completed actions so the model doesn't backtrack
       if (action.type === "navigate") {
         completedActions.push(`Navigated to ${action.url}`);
@@ -1601,6 +1720,8 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
         clickNoEffectCount = 0;
       }
     }
+    // Track whether this round's actions may have changed the DOM
+    prevActionsChangedDom = actions.some(a => DOM_CHANGING_ACTIONS.has(a.type));
   }
 
   // Write result to task context if sub-agent
@@ -1627,7 +1748,7 @@ async function showPermissionAndWait(tabId, description) {
 }
 
 // ---- Multi-tab task runner ----
-async function runMultiTabTask(decision, intentText, signal) {
+async function runMultiTabTask(decision, intentText, signal, referenceB64 = null) {
   const { parallelSubtasks = [], skill } = decision;
   if (!parallelSubtasks.length) return null;
 
@@ -1665,19 +1786,46 @@ async function runMultiTabTask(decision, intentText, signal) {
   broadcastEvent({ type: "TASK_STARTED", taskId, tabs: taskContext.tabs });
 
   // Run sub-agents in parallel
-  const results = await Promise.allSettled(tabIds.map((tabId, i) =>
-    runVisionActionAgent(tabId, parallelSubtasks[i].subGoal, skill, taskContext, i, signal)
-  ));
+  // For price-compare each tab handles ONE site only — prepend that constraint so the
+  // sub-agent doesn't try to navigate to multiple sites using the full skill prompt.
+  const results = await Promise.allSettled(tabIds.map((tabId, i) => {
+    const sub = parallelSubtasks[i];
+    const effectiveGoal = (skill === "price-compare")
+      ? `${sub.subGoal}. IMPORTANT: You are one of ${parallelSubtasks.length} parallel agents each handling a different site. Search ONLY ${sub.startUrl} — do NOT navigate to any other shopping site. You MUST finish with an extract action containing the actual price and title values you see on screen (e.g. {"type":"extract","fields":{"price":"₹499","title":"Green Cushion Cover","site":"Flipkart","url":"..."}}). Only AFTER the extract action, set done=true.`
+      : sub.subGoal;
+    return runVisionActionAgent(tabId, effectiveGoal, skill, taskContext, i, signal, referenceB64);
+  }));
 
   // Merge results
-  const extractedParts = results.map((r, i) =>
-    r.status === "fulfilled" ? taskContext.tabs[i].extractedData : { error: r.reason?.message }
-  );
+  const extractedParts = results.map((r, i) => {
+    if (r.status !== "fulfilled") return { error: r.reason?.message };
+    const d = taskContext.tabs[i].extractedData;
+    // If the agent finished but never ran an extract action, mark as not found
+    if (!d || Object.keys(d).length === 0) return { error: "Agent completed without extracting data" };
+    return d;
+  });
 
   try {
-    const mergePrompt = `The user asked: "${intentText}"
+    const isPriceCompare = skill === "price-compare";
+    const mergePrompt = isPriceCompare
+      ? `The user asked: "${intentText}"
 
-Data collected from each source:
+Price data collected from each site:
+${extractedParts.map((d, i) => `${parallelSubtasks[i].startUrl}: ${JSON.stringify(d)}`).join("\n")}
+
+Produce a price comparison. Format it EXACTLY like this (fill in real values, skip sites with no data):
+**Price Comparison**
+• Amazon: ₹[price] — [product title]
+• Flipkart: ₹[price] — [product title]
+• [Site3]: ₹[price] — [product title]
+
+**Best Deal:** [site name] at ₹[lowest price]
+**Recommendation:** [1 sentence: which to buy and why]
+
+Use only data provided above. If a site has no price, write "Not found".`
+      : `The user asked: "${intentText}"
+
+Data collected:
 ${extractedParts.map((d, i) => `Source ${i + 1} (${parallelSubtasks[i].startUrl}): ${JSON.stringify(d)}`).join("\n")}
 
 Write a clear, concise answer comparing the data. Be specific with numbers and names.`;
@@ -1687,8 +1835,39 @@ Write a clear, concise answer comparing the data. Be specific with numbers and n
     ]);
 
     taskContext.status = "done";
-    broadcastEvent({ type: "TASK_COMPLETE", taskId, summary });
-    sendToGeminiLive(`[TASK_DONE: ${summary}]`);
+    broadcastEvent({ type: "TASK_COMPLETE", taskId, summary, formatted: true });
+    // Voice summary is a shorter version without markdown symbols
+    const voiceSummary = summary.replace(/\*\*/g, "").replace(/•/g, "-");
+    sendToGeminiLive(`[TASK_DONE: ${voiceSummary}]`);
+
+    // For price-compare: offer to open the best deal URL if we have one
+    if (isPriceCompare) {
+      const parsePrice = (str) => {
+        if (!str || typeof str !== "string") return Infinity;
+        const n = parseFloat(str.replace(/[^0-9.]/g, ""));
+        return isNaN(n) ? Infinity : n;
+      };
+      const bestDeal = extractedParts
+        .filter(d => d && !d.error && d.price && parsePrice(d.price) < Infinity)
+        .sort((a, b) => parsePrice(a.price) - parsePrice(b.price))[0];
+
+      if (bestDeal?.url && bestDeal.url.startsWith("http")) {
+        const label = `${bestDeal.title ? bestDeal.title.slice(0, 50) : "the product"} at ${bestDeal.price} on ${bestDeal.site || "the site"}`;
+        const answer = await waitForUserFieldInput(
+          `Best deal is ${label}. Want me to open it for you?`,
+          "open_best_deal",
+          false,
+          30000
+        );
+        const wantsOpen = /\b(yes|yeah|yep|ok|okay|sure|go|open|show|please|do it)\b/i.test(answer || "");
+        if (wantsOpen) {
+          chrome.tabs.query({ active: true, currentWindow: true }, ([activeTab]) => {
+            if (activeTab) chrome.tabs.update(activeTab.id, { url: bestDeal.url, active: true });
+          });
+        }
+      }
+    }
+
     return summary;
   } catch (e) {
     taskContext.status = "failed";
@@ -1700,6 +1879,35 @@ Write a clear, concise answer comparing the data. Be specific with numbers and n
 
 // ---- Screen description (for visual-reference intents) ----
 const SCREEN_REF = /\b(on screen|on the screen|this page|current page|what i see|what('s| is) on|like this|this one|looking at|can you see|see this|visible|showing|displayed|screenshot|this tab|current tab)\b/i;
+
+// Matches when user references a text document open in the current tab
+const DOC_REF = /\b(this document|in this doc|from this doc|this doc|the document|in the document|from the document|this file|in this file|on this page|from this page|description (is |are )?(in|on|from)|specs? (are |is )?(in|on|from)|requirements? (are |is )?(in|on|from))\b/i;
+
+// Extract readable text from the current tab (for docs, articles, etc.)
+async function extractPageText(tabId, maxChars = 4000) {
+  try {
+    const { result } = await cdp(tabId, "Runtime.evaluate", {
+      expression: `
+        (function() {
+          // Google Docs: get text from the canvas-rendered doc area
+          const gdoc = document.querySelector('.kix-appview-editor');
+          if (gdoc) return gdoc.innerText.slice(0, ${maxChars});
+          // Notion, Confluence, etc.
+          const article = document.querySelector('article, [role="main"], main, .notion-page-content');
+          if (article) return article.innerText.slice(0, ${maxChars});
+          // Fallback: body text
+          return document.body.innerText.slice(0, ${maxChars});
+        })()
+      `,
+      returnByValue: true
+    });
+    const text = result?.value?.trim();
+    return text?.length > 50 ? text : null;
+  } catch (e) {
+    console.warn("BG: extractPageText failed:", e.message);
+    return null;
+  }
+}
 
 async function describeCurrentScreen(tabId) {
   try {
@@ -1740,25 +1948,40 @@ async function dispatchTask(intentText, currentTab) {
 
   broadcastEvent({ type: "TASK_DISPATCHED", intentText });
 
+  // Augment with screen context FIRST — must happen before fast-path so skills like
+  // price-compare and shopping know what product is on screen before routing.
+  if (currentTab?.id) {
+    const tabUrl = currentTab.url || "";
+    // Always extract text when on a known document platform — regardless of how Gemini phrased the intent
+    const IS_DOC_PAGE = /docs\.google\.com|notion\.so|confluence|quip\.com|coda\.io|dropbox\.com\/.*\.(doc|txt)/.test(tabUrl);
+    if (IS_DOC_PAGE || DOC_REF.test(intentText)) {
+      const pageText = await extractPageText(currentTab.id).catch(() => null);
+      if (pageText && !intentText.includes("[DOC CONTENT:")) {
+        intentText = `${intentText} [DOC CONTENT: ${pageText}]`;
+        console.log("BG: Injected doc text, chars:", pageText.length);
+        broadcastEvent({ type: "INTENT_DETECTED", intentText });
+      }
+    }
+    // Visual/product reference: describe the current screen via screenshot
+    if (SCREEN_REF.test(intentText) && !IS_DOC_PAGE) {
+      const screenDesc = await describeCurrentScreen(currentTab.id).catch(() => null);
+      if (screenDesc) {
+        intentText = `${intentText} [SCREEN SHOWS: ${screenDesc}]`;
+        console.log("BG: Augmented intent with screen:", intentText.slice(0, 100));
+        broadcastEvent({ type: "INTENT_DETECTED", intentText });
+      }
+    }
+  }
+
   // Fast-path skill routing — runs before orchestrator so we never block on API failure
   const fastSkill = inferSkillFromIntent(intentText);
   if (fastSkill) {
-    console.log("BG: Fast-path skill:", fastSkill, "for:", intentText);
-    const planText = `On it — using ${fastSkill} for: ${intentText}`;
+    console.log("BG: Fast-path skill:", fastSkill, "for:", intentText.slice(0, 80));
+    const planText = `On it — using ${fastSkill}.`;
     broadcastEvent({ type: "PLAN_ANNOUNCED", planText });
     sendToGeminiLive(`[STATUS: Starting now.]`);
     await executePlan({ taskType: "simple", skill: fastSkill, steps: [] }, intentText, currentTab);
     return;
-  }
-
-  // If user references the screen, describe it first and augment the intent
-  if (SCREEN_REF.test(intentText) && currentTab?.id) {
-    const screenDesc = await describeCurrentScreen(currentTab.id).catch(() => null);
-    if (screenDesc) {
-      intentText = `${intentText} [SCREEN SHOWS: ${screenDesc}]`;
-      console.log("BG: Augmented intent with screen:", intentText.slice(0, 100));
-      broadcastEvent({ type: "INTENT_DETECTED", intentText });
-    }
   }
 
   // Run orchestrator for routing decisions (best-effort — never blocks execution on failure)
@@ -1795,8 +2018,64 @@ async function executePlan(decision, intentText, currentTab) {
       return;
     }
 
-    if (taskType === "multi-tab-parallel") {
-      await runMultiTabTask(decision, intentText, signal);
+    // price-compare always runs in parallel tabs — fallback if orchestrator missed it
+    if (skill === "price-compare" && taskType !== "multi-tab-parallel") {
+      decision.taskType = "multi-tab-parallel";
+      if (!decision.parallelSubtasks?.length) {
+        // Extract the product description from SCREEN SHOWS so sub-agents get a real search term
+        const screenMatch = intentText.match(/\[SCREEN SHOWS:\s*([^\]]+)\]/);
+        const productHint = screenMatch
+          ? screenMatch[1].slice(0, 200)
+          : intentText.replace(/\[SCREEN SHOWS:[^\]]*\]/g, "").trim().slice(0, 120);
+
+        // Detect explicitly mentioned sites — if user said "Amazon or Flipkart", use only those
+        const it = intentText.toLowerCase();
+        const SITE_MAP = [
+          { re: /\bamazon\b/,   label: "Amazon India",  url: "https://www.amazon.in" },
+          { re: /\bflipcart\b|\bflipkart\b/, label: "Flipkart", url: "https://www.flipkart.com" },
+          { re: /\bikea\b/,     label: "IKEA India",    url: "https://www.ikea.com/in" },
+          { re: /\bmyntra\b/,   label: "Myntra",        url: "https://www.myntra.com" },
+          { re: /\bcroma\b/,    label: "Croma",         url: "https://www.croma.com" },
+          { re: /\bmeesho\b/,   label: "Meesho",        url: "https://www.meesho.com" },
+          { re: /\bnykaa\b/,    label: "Nykaa",         url: "https://www.nykaa.com" },
+        ];
+        const mentionedSites = SITE_MAP.filter(s => s.re.test(it));
+
+        let sites;
+        if (mentionedSites.length >= 2) {
+          // User explicitly named specific sites — use only those
+          sites = mentionedSites;
+        } else if (mentionedSites.length === 1) {
+          // User named one site — add a second sensible default
+          const other = mentionedSites[0].url.includes("amazon") ? SITE_MAP[1] : SITE_MAP[0];
+          sites = [mentionedSites[0], other];
+        } else {
+          // No explicit sites — default to Amazon + Flipkart + category-appropriate third
+          sites = [
+            { label: "Amazon India", url: "https://www.amazon.in" },
+            { label: "Flipkart",     url: "https://www.flipkart.com" },
+            { label: "IKEA India",   url: "https://www.ikea.com/in" },
+          ];
+        }
+
+        decision.parallelSubtasks = sites.map(s => ({
+          subGoal: `Search for a product matching this description on ${s.label} and extract the CHEAPEST matching price and title from search results: "${productHint}"`,
+          startUrl: s.url
+        }));
+      }
+    }
+
+    if (taskType === "multi-tab-parallel" || decision.taskType === "multi-tab-parallel") {
+      // Capture the original tab's screenshot to share with sub-agents as a visual reference
+      let referenceB64 = null;
+      try {
+        if (currentTab?.id) {
+          ({ annotatedB64: referenceB64 } = await buildAnnotatedScreenshot(currentTab.id));
+        }
+      } catch (e) {
+        console.warn("BG: Failed to capture reference screenshot for sub-agents:", e.message);
+      }
+      await runMultiTabTask(decision, intentText, signal, referenceB64);
       return;
     }
 

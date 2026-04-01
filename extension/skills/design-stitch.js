@@ -5,36 +5,35 @@ const designStitch = {
   systemPromptAddition: `
 DESIGN-STITCH SKILL ACTIVE. You are generating a UI/app design using Google Stitch.
 
-*** YOUR VERY FIRST ACTION MUST BE THIS — DO NOT CLICK ANYTHING FIRST: ***
-{"type":"navigate","url":"https://stitch.withgoogle.com"}
+IMPORTANT — IF THE TASK CONTAINS [DOC CONTENT: ...]:
+- The text inside [DOC CONTENT: ...] is the app/product description extracted from the user's document.
+- Use this content to write a detailed, specific design prompt for Stitch.
+- Summarize the key purpose, features, screens, and style from the document into a clear design brief.
+- Do NOT just paste the raw doc text — craft it into a good design prompt.
 
-STEP 1 — Navigate to Google Stitch:
-- Output the navigate action above as your FIRST action. Do not click the address bar. Do not type a URL. Just output the navigate action.
-- Wait for the page to load.
+STEP 1 — Find the prompt input on Stitch:
+- Look for a textarea or input that says "Describe your app", "What would you like to build?", or similar.
+- If the page appears blank or has 0 elements: wait 3 seconds {"type":"wait","ms":3000} then check again.
+- If STILL blank after 2 waits (rounds 3+): navigate to Canva instead — {"type":"navigate","url":"https://www.canva.com"}.
 
-STEP 2 — Find the prompt input:
-- Look for a text input, textarea, or prompt field where you describe what to design.
-- It may say "Describe your app", "What would you like to build?", "Describe your UI", or similar.
-
-STEP 3 — Enter the design prompt:
-- Type a clear, detailed description of what to design. Include:
-  - Type of interface (landing page, mobile app, dashboard, form, etc.)
-  - Purpose / what it does
-  - Key sections or elements to include
-  - Visual style if mentioned (minimalist, colorful, professional, etc.)
-  - Example: "A fitness app landing page with a hero section, features list, pricing table, and CTA button. Clean, modern style with green and white colors."
+STEP 2 — Enter the design prompt:
+- Type a clear description of what to design. Include:
+  - Type of interface (mobile app, dashboard, landing page, etc.)
+  - App purpose and key features from the document (if available)
+  - Key screens or sections to include
+  - Visual style if mentioned (clean, colorful, minimal, etc.)
 - After typing, press Enter or click the "Generate" / "Create" / submit button.
 
-STEP 4 — Wait for generation:
-- Design generation takes 10–30 seconds. Use {"type":"wait","ms":4000} between checks.
-- Keep checking screenshots until a design preview or canvas appears.
-- DONE when a rendered design or UI preview is visible on screen.
+STEP 3 — Wait for generation:
+- Design generation takes 10–30 seconds.
+- Use {"type":"wait","ms":5000} between checks.
+- Keep checking until a design preview or canvas appears.
+- DONE when a rendered design or UI preview is visible.
 
-FALLBACK — If Google Stitch fails to load or is unavailable:
-- Navigate to Canva instead: {"type":"navigate","url":"https://www.canva.com"}
-- Click "Create a design" and choose the appropriate template type (Presentation, Website, Instagram post, etc.)
+FALLBACK — If you navigate to Canva:
+- Click "Create a design" and choose the appropriate type.
 - Search for a relevant template and open it.
-- DONE when a design template is open for editing.
+- DONE when a Canva design is open for editing.
 
 DONE when a design preview is visible, or a Canva template is open for editing.
 `.trim(),
