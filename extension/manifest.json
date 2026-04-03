@@ -22,7 +22,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["content.js", "robot/robot.js"],
       "run_at": "document_idle"
     }
   ],
@@ -30,8 +30,14 @@
   "side_panel": { "default_path": "sidepanel.html" },
   "web_accessible_resources": [
     {
-      "resources": ["audio-processor.js", "offscreen.html", "skills/*.js"],
+      "resources": ["audio-processor.js", "offscreen.html", "skills/*.js", "robot/robot.css"],
       "matches": ["<all_urls>"]
     }
-  ]
+  ],
+  "commands": {
+    "open-settings": {
+      "suggested_key": { "default": "Ctrl+Shift+K", "mac": "Command+Shift+K" },
+      "description": "Open ctrl settings panel"
+    }
+  }
 }

@@ -20,6 +20,7 @@ const fieldQuestionText = document.getElementById("field-question-text");
 const fieldAnswerInput = document.getElementById("field-answer-input");
 const fieldAnswerSend = document.getElementById("field-answer-send");
 const statusBadge = document.getElementById("status-badge");
+const robotWrap   = document.getElementById("robot-wrap");
 const taskCard = document.getElementById("task-card");
 const taskText = document.getElementById("task-text");
 const skillBadge = document.getElementById("skill-badge");
@@ -548,6 +549,7 @@ function setStatus(state) {
     error: "Error"
   };
   statusBadge.textContent = labels[state] || state;
+  if (robotWrap) robotWrap.className = `state-${state}`;
 }
 
 function showTaskCard(text) {

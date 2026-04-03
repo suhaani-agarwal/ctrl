@@ -1,164 +1,234 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>ctrl</title>
-    <link rel="stylesheet" href="sidepanel.css" />
-  </head>
-  <body>
-    <div id="panel">
-      <!-- Header -->
-      <header>
-        <span class="agent-name">ctrl</span>
-        <span id="status-badge" class="badge idle">Idle</span>
-        <button
-          id="abort-btn"
-          class="abort-btn hidden"
-          title="Abort current task"
-        >
-          &#9632; Stop
-        </button>
-      </header>
+<head>
+  <meta charset="UTF-8"/>
+  <title>ctrl</title>
+  <link rel="stylesheet" href="sidepanel.css"/>
+</head>
+<body>
+<div id="panel">
 
-      <!-- Task card (shown when task is running) -->
-      <div id="task-card" class="hidden">
-        <div id="task-text"></div>
-        <div id="task-meta">
-          <span id="skill-badge" class="skill-tag hidden"></span>
-          <span id="step-counter" class="step-tag hidden"></span>
-        </div>
-        <div id="tab-badges"></div>
-      </div>
+  <!-- Top bar -->
+  <div id="top-bar">
+    <span class="agent-name">ctrl</span>
+    <div id="top-actions">
+      <button id="record-btn" class="icon-btn" title="Record workflow">&#9210;</button>
+      <button id="settings-btn" class="icon-btn" title="Settings">&#9881;</button>
+      <button id="abort-btn" class="abort-btn hidden" title="Abort current task">&#9632; Stop</button>
+    </div>
+    <!-- Hidden but still updated by JS for backward compat -->
+    <span id="status-badge" class="badge idle">Idle</span>
+  </div>
 
-      <!-- Voice transcript (conversation bubbles) -->
-      <div id="transcript"></div>
+  <!-- Robot character area -->
+  <div id="robot-section">
+    <div id="robot-wrap" class="state-idle">
 
-      <!-- Field question panel (shown when agent needs user input) -->
-      <div id="field-question-panel" class="hidden">
-        <div id="field-question-text"></div>
-        <div id="field-input-row">
-          <input
-            type="text"
-            id="field-answer-input"
-            placeholder="Type your answer..."
-          />
-          <button id="field-answer-send">Send</button>
-        </div>
-        <div id="field-input-hint">Press Enter or click Send</div>
-      </div>
+      <svg id="robot-svg" viewBox="0 0 120 157" xmlns="http://www.w3.org/2000/svg">
 
-      <!-- Live action log -->
-      <div id="action-log-wrap">
-        <div id="action-log-header">Action Log</div>
-        <div id="action-log"></div>
-      </div>
+        <!-- Antenna wire -->
+        <line x1="60" y1="10" x2="60" y2="22" stroke="#3a3a5c" stroke-width="3" stroke-linecap="round"/>
+        <!-- Antenna LED -->
+        <circle id="antenna-tip" cx="60" cy="6" r="6" fill="#818cf8"/>
 
-      <!-- Footer controls -->
-      <footer>
-        <button id="record-btn" class="icon-btn" title="Record workflow">
-          &#9210;
-        </button>
-        <button
-          id="mic-btn"
-          class="mic-btn mic-off"
-          title="Click to start/stop listening"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            width="26"
-            height="26"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-            <line x1="12" y1="19" x2="12" y2="23" />
-            <line x1="8" y1="23" x2="16" y2="23" />
+        <!-- Head -->
+        <rect id="robot-head" x="22" y="22" width="76" height="54" rx="18" fill="#1a1a30" stroke="#818cf8" stroke-width="2"/>
+
+        <!-- Ear bumps -->
+        <rect x="14" y="36" width="10" height="20" rx="5" fill="#252542"/>
+        <rect x="96" y="36" width="10" height="20" rx="5" fill="#252542"/>
+
+        <!-- Eye sockets -->
+        <g class="eye-group eye-left" style="transform-box:fill-box;transform-origin:center">
+          <circle cx="42" cy="46" r="13" fill="#0c0c1e"/>
+          <circle id="pupil-left" cx="42" cy="46" r="8" fill="#818cf8"/>
+          <circle cx="45.5" cy="42.5" r="2.8" fill="white" opacity="0.8"/>
+        </g>
+        <g class="eye-group eye-right" style="transform-box:fill-box;transform-origin:center">
+          <circle cx="78" cy="46" r="13" fill="#0c0c1e"/>
+          <circle id="pupil-right" cx="78" cy="46" r="8" fill="#818cf8"/>
+          <circle cx="81.5" cy="42.5" r="2.8" fill="white" opacity="0.8"/>
+        </g>
+
+        <!-- Blush marks (cute!) -->
+        <ellipse cx="31" cy="57" rx="7" ry="4" fill="#ff69b4" opacity="0.3"/>
+        <ellipse cx="89" cy="57" rx="7" ry="4" fill="#ff69b4" opacity="0.3"/>
+
+        <!-- Mouth expressions (CSS shows one at a time) -->
+        <path class="mouth-expr mouth-smile"     d="M 44 66 Q 60 76 76 66"                                   stroke="#818cf8" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+        <ellipse class="mouth-expr mouth-open"   cx="60" cy="67" rx="10" ry="7"                              fill="#0a0a1a" stroke="#4ade80" stroke-width="2"/>
+        <path class="mouth-expr mouth-think"     d="M 45 67 L 51 62 L 57 67 L 63 62 L 69 67 L 75 67"        stroke="#a78bfa" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <path class="mouth-expr mouth-determined" d="M 45 67 L 75 67"                                        stroke="#f97316" stroke-width="3" stroke-linecap="round"/>
+        <path class="mouth-expr mouth-sad"        d="M 44 71 Q 60 62 76 71"                                  stroke="#f87171" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+
+        <!-- Neck -->
+        <rect x="49" y="76" width="22" height="10" rx="4" fill="#252542"/>
+
+        <!-- Body -->
+        <rect id="robot-body" x="16" y="86" width="88" height="54" rx="14" fill="#1a1a30" stroke="#252542" stroke-width="2"/>
+
+        <!-- Chest screen -->
+        <rect x="28" y="95" width="64" height="38" rx="8" fill="#0c0c1a" stroke="#818cf8" stroke-width="1.5"/>
+
+        <!-- Chest display — one group visible at a time via CSS -->
+        <g class="chest-state chest-idle">
+          <rect x="36" y="104" width="48" height="2" rx="1" fill="#818cf8" opacity="0.25"/>
+          <rect x="36" y="110" width="32" height="2" rx="1" fill="#818cf8" opacity="0.18"/>
+          <rect x="36" y="116" width="40" height="2" rx="1" fill="#818cf8" opacity="0.22"/>
+          <text x="60" y="127" text-anchor="middle" font-size="7" fill="#818cf8" opacity="0.4" font-family="monospace" letter-spacing="2">CTRL</text>
+        </g>
+
+        <g class="chest-state chest-listening">
+          <rect class="bar"     x="33" y="108" width="5" height="10" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar bar2" x="40" y="103" width="5" height="18" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar bar3" x="47" y="107" width="5" height="12" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar bar4" x="54" y="100" width="5" height="23" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar bar3" x="61" y="105" width="5" height="15" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar bar2" x="68" y="109" width="5" height="8"  rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+          <rect class="bar"     x="75" y="107" width="5" height="11" rx="2.5" fill="#4ade80" style="transform-box:fill-box;transform-origin:bottom"/>
+        </g>
+
+        <g class="chest-state chest-thinking">
+          <circle class="dot dot1" cx="46" cy="114" r="5" fill="#a78bfa" style="transform-box:fill-box;transform-origin:center"/>
+          <circle class="dot dot2" cx="60" cy="114" r="5" fill="#a78bfa" style="transform-box:fill-box;transform-origin:center"/>
+          <circle class="dot dot3" cx="74" cy="114" r="5" fill="#a78bfa" style="transform-box:fill-box;transform-origin:center"/>
+        </g>
+
+        <g class="chest-state chest-acting">
+          <polygon points="63,96 54,113 62,113 57,129 71,110 62,110" fill="#f97316"/>
+          <polygon points="63,96 54,113 62,113 57,129 71,110 62,110" fill="#f97316" opacity="0.5">
+            <animateTransform attributeName="transform" type="scale" values="1;1.08;1" dur="0.35s" repeatCount="indefinite" additive="sum"/>
+          </polygon>
+        </g>
+
+        <g class="chest-state chest-error">
+          <line x1="38" y1="100" x2="82" y2="130" stroke="#f87171" stroke-width="3.5" stroke-linecap="round"/>
+          <line x1="82" y1="100" x2="38" y2="130" stroke="#f87171" stroke-width="3.5" stroke-linecap="round"/>
+        </g>
+
+        <!-- Left arm -->
+        <rect id="arm-left"  x="2"   y="90" width="14" height="44" rx="7" fill="#252542" style="transform-box:fill-box;transform-origin:top center"/>
+        <circle cx="9"   cy="136" r="8" fill="#1c1c38" stroke="#252542" stroke-width="1.5"/>
+
+        <!-- Right arm -->
+        <rect id="arm-right" x="104" y="90" width="14" height="44" rx="7" fill="#252542" style="transform-box:fill-box;transform-origin:top center"/>
+        <circle cx="111" cy="136" r="8" fill="#1c1c38" stroke="#252542" stroke-width="1.5"/>
+
+        <!-- Legs -->
+        <rect x="28" y="140" width="22" height="14" rx="5" fill="#252542"/>
+        <rect x="70" y="140" width="22" height="14" rx="5" fill="#252542"/>
+
+        <!-- Feet -->
+        <rect x="22" y="148" width="30" height="9" rx="4.5" fill="#1a1a2e" stroke="#252542" stroke-width="1.5"/>
+        <rect x="68" y="148" width="30" height="9" rx="4.5" fill="#1a1a2e" stroke="#252542" stroke-width="1.5"/>
+
+      </svg>
+
+      <!-- Mic button -->
+      <div id="mic-wrap">
+        <button id="mic-btn" class="mic-btn mic-off" title="Click to start/stop listening">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
           </svg>
         </button>
-        <button id="settings-btn" class="icon-btn" title="Settings">
-          &#9881;
-        </button>
-      </footer>
-
-      <!-- Recording banner -->
-      <div id="recording-banner" class="hidden">
-        <span class="rec-dot"></span> Recording workflow&hellip; say &ldquo;stop
-        recording&rdquo; to save.
+        <span class="mic-label">tap to speak</span>
       </div>
 
-      <!-- Settings drawer -->
-      <div id="settings-drawer" class="hidden">
-        <div class="settings-header">
-          <span class="settings-title">Settings</span>
-          <button id="settings-close-btn" title="Back">&#8592; Back</button>
-        </div>
-        <div class="settings-section">
-          <label>Gemini API Key</label>
-          <input
-            type="password"
-            id="gemini-key"
-            placeholder="Paste Gemini key..."
-          />
-          <span class="hint">Get yours at aistudio.google.com</span>
-        </div>
-        <div class="settings-section">
-          <label>Groq API Key</label>
-          <input
-            type="password"
-            id="groq-key"
-            placeholder="Paste Groq key..."
-          />
-          <span class="hint">Get yours at console.groq.com</span>
-        </div>
-        <div class="settings-section">
-          <label>OpenRouter API Key</label>
-          <input
-            type="password"
-            id="openrouter-key"
-            placeholder="Paste OpenRouter key..."
-          />
-          <span class="hint"
-            >Get yours at openrouter.ai/keys (free tier works)</span
-          >
-        </div>
-        <div class="settings-section">
-          <label>Permission Mode</label>
-          <select id="permission-mode">
-            <option value="ask">Ask Always</option>
-            <option value="domain">Ask Per Domain</option>
-            <option value="silent">Silent</option>
-          </select>
-        </div>
-        <div class="settings-section">
-          <label>Installed Skills</label>
-          <div id="skills-list"></div>
-          <div class="skill-install-row">
-            <input
-              type="text"
-              id="skill-url"
-              placeholder="GitHub raw URL to install skill..."
-            />
-            <button id="install-skill-btn">Install</button>
-          </div>
-          <span id="install-status" class="hint"></span>
-        </div>
-        <div class="settings-section">
-          <label>Saved Workflows</label>
-          <div id="workflows-list"></div>
-        </div>
-        <div class="settings-section">
-          <label>Profile Memory</label>
-          <div id="profile-list"></div>
-          <span id="profile-empty-hint" class="hint"
-            >No profile data saved yet.</span
-          >
-        </div>
+    </div><!-- #robot-wrap -->
+  </div><!-- #robot-section -->
+
+  <!-- Think bubble -->
+  <div id="think-bubble">
+
+    <!-- Task card -->
+    <div id="task-card" class="hidden">
+      <div id="task-text"></div>
+      <div id="task-meta">
+        <span id="skill-badge" class="skill-tag hidden"></span>
+        <span id="step-counter" class="step-tag hidden"></span>
       </div>
+      <div id="tab-badges"></div>
     </div>
-    <script src="sidepanel.js"></script>
-  </body>
+
+    <!-- Transcript (conversation bubbles) -->
+    <div id="transcript"></div>
+
+    <!-- Field question panel -->
+    <div id="field-question-panel" class="hidden">
+      <div id="field-question-text"></div>
+      <div id="field-input-row">
+        <input type="text" id="field-answer-input" placeholder="Type your answer..."/>
+        <button id="field-answer-send">Send</button>
+      </div>
+      <div id="field-input-hint">Press Enter or click Send</div>
+    </div>
+
+    <!-- Action log -->
+    <div id="action-log-wrap">
+      <div id="action-log-header">Action Log</div>
+      <div id="action-log"></div>
+    </div>
+
+  </div><!-- #think-bubble -->
+
+  <!-- Recording banner -->
+  <div id="recording-banner" class="hidden">
+    <span class="rec-dot"></span> Recording&hellip; say &ldquo;stop recording&rdquo; to save.
+  </div>
+
+  <!-- Settings drawer (full overlay) -->
+  <div id="settings-drawer" class="hidden">
+    <div class="settings-header">
+      <span class="settings-title">Settings</span>
+      <button id="settings-close-btn" title="Back">&#8592; Back</button>
+    </div>
+    <div class="settings-section">
+      <label>Gemini API Key</label>
+      <input type="password" id="gemini-key" placeholder="Paste Gemini key..."/>
+      <span class="hint">Get yours at aistudio.google.com</span>
+    </div>
+    <div class="settings-section">
+      <label>Groq API Key</label>
+      <input type="password" id="groq-key" placeholder="Paste Groq key..."/>
+      <span class="hint">Get yours at console.groq.com</span>
+    </div>
+    <div class="settings-section">
+      <label>OpenRouter API Key</label>
+      <input type="password" id="openrouter-key" placeholder="Paste OpenRouter key..."/>
+      <span class="hint">Get yours at openrouter.ai/keys (free tier works)</span>
+    </div>
+    <div class="settings-section">
+      <label>Permission Mode</label>
+      <select id="permission-mode">
+        <option value="ask">Ask Always</option>
+        <option value="domain">Ask Per Domain</option>
+        <option value="silent">Silent</option>
+      </select>
+    </div>
+    <div class="settings-section">
+      <label>Installed Skills</label>
+      <div id="skills-list"></div>
+      <div class="skill-install-row">
+        <input type="text" id="skill-url" placeholder="GitHub raw URL to install skill..."/>
+        <button id="install-skill-btn">Install</button>
+      </div>
+      <span id="install-status" class="hint"></span>
+    </div>
+    <div class="settings-section">
+      <label>Saved Workflows</label>
+      <div id="workflows-list"></div>
+    </div>
+    <div class="settings-section">
+      <label>Profile Memory</label>
+      <div id="profile-list"></div>
+      <span id="profile-empty-hint" class="hint">No profile data saved yet.</span>
+    </div>
+  </div>
+
+</div><!-- #panel -->
+<script src="sidepanel.js"></script>
+</body>
 </html>

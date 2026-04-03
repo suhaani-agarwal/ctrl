@@ -25,6 +25,8 @@ let pendingTask = null;     // { intentText, decision, tab, step: "clarify"|"con
 let pendingFieldQuestion = null; // { fieldKey, question, isSubjective, resolve } — pauses agent loop for user input
 let isTaskRunning = false;  // blocks ambient speech from aborting an in-progress task
 let pendingTaskCooldownUntil = 0; // ignore mic input for N ms after asking a question (prevents Gemini audio feedback)
+let currentAgentTabId = null; // tab where the robot overlay is active
+let robotMicTabId = null;     // set when mic is started from the robot content script (not sidepanel)
 
 // CDP: tabId → { attached: boolean }
 const cdpSessions = new Map();
@@ -37,6 +39,13 @@ const taskContexts = new Map();
 // ---- Init ----
 chrome.action.onClicked.addListener((tab) => chrome.sidePanel.open({ windowId: tab.windowId }));
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => { });
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "open-settings") {
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+      if (tab) chrome.sidePanel.open({ windowId: tab.windowId });
+    });
+  }
+});
 
 // Load skills and restore API keys on startup (service workers restart frequently)
 async function onStartup() {
@@ -52,9 +61,89 @@ onStartup();
 // Sends { type: "AGENT_EVENT", event: { type, ...fields } } to the side panel.
 function broadcastEvent(event) {
   chrome.runtime.sendMessage({ type: "AGENT_EVENT", event }).catch(() => { });
+  forwardToRobot(event);
 }
 function broadcastRaw(msg) {
   chrome.runtime.sendMessage(msg).catch(() => { });
+}
+
+// ---- Robot relay ----
+function sendToRobot(tabId, msg) {
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, msg).catch(() => { });
+}
+
+function forwardToRobot(event) {
+  const tid = event.tabId || currentAgentTabId;
+  if (event.tabId) currentAgentTabId = event.tabId;
+
+  switch (event.type) {
+    case "ORCHESTRATOR_START":
+      sendToRobot(tid, { type: "ROBOT_STATE", state: "thinking" });
+      sendToRobot(tid, { type: "ROBOT_MSG", text: "Figuring out what to do…", msgType: "thought" });
+      break;
+    case "PLAN_ANNOUNCED":
+      sendToRobot(tid, { type: "ROBOT_BULB", text: event.planText || "Got a plan!" });
+      break;
+    case "AGENT_START":
+      currentAgentTabId = event.tabId;
+      sendToRobot(event.tabId, { type: "ROBOT_STATE", state: "acting" });
+      sendToRobot(event.tabId, { type: "ROBOT_MSG", text: event.goal ? event.goal.slice(0, 80) : "On it!", msgType: "shout" });
+      break;
+    case "THINKING":
+      sendToRobot(tid, { type: "ROBOT_STATE", state: "thinking" });
+      break;
+    case "THOUGHT":
+      if (event.thought) sendToRobot(tid, { type: "ROBOT_MSG", text: event.thought.slice(0, 120), msgType: "thought" });
+      break;
+    case "EXECUTING":
+      if (event.action) {
+        sendToRobot(tid, { type: "ROBOT_STATE", state: "acting" });
+        if (event.action.type === "click" && event.elementName)
+          sendToRobot(tid, { type: "ROBOT_MSG", text: `Clicking ${event.elementName}`, msgType: "action" });
+        else if (event.action.type === "navigate" && event.action.url)
+          sendToRobot(tid, { type: "ROBOT_MSG", text: `Navigating to ${event.action.url}`, msgType: "action" });
+        else if (event.elementName)
+          sendToRobot(tid, { type: "ROBOT_MSG", text: event.elementName.slice(0, 80), msgType: "action" });
+        if (event.action.x != null && event.action.y != null)
+          sendToRobot(tid, { type: "ROBOT_ACT_AT", x: event.action.x, y: event.action.y });
+      }
+      break;
+    case "ACTION_VERIFIED":
+      sendToRobot(tid, { type: "ROBOT_MSG", text: "✓ Done", msgType: "shout", dur: 1200 });
+      break;
+    case "ACTION_FAILED":
+      sendToRobot(tid, { type: "ROBOT_STATE", state: "error" });
+      if (event.error) sendToRobot(tid, { type: "ROBOT_MSG", text: event.error.slice(0, 80), msgType: "speech" });
+      break;
+    case "TASK_COMPLETE":
+    case "AGENT_DONE":
+      sendToRobot(tid, { type: "ROBOT_MSG", text: "All done! ✓", msgType: "shout" });
+      sendToRobot(tid, { type: "ROBOT_RESET" });
+      break;
+    case "TASK_FAILED":
+      sendToRobot(tid, { type: "ROBOT_STATE", state: "error" });
+      sendToRobot(tid, { type: "ROBOT_MSG", text: event.error ? event.error.slice(0, 80) : "Something went wrong", msgType: "speech" });
+      sendToRobot(tid, { type: "ROBOT_RESET" });
+      break;
+    case "TASK_ABORTED":
+    case "AGENT_ABORTED":
+      sendToRobot(tid, { type: "ROBOT_RESET" });
+      break;
+    case "STEP_START":
+      sendToRobot(tid, { type: "ROBOT_MSG", text: `Step ${event.step}/${event.total}: ${(event.desc || "").slice(0, 80)}`, msgType: "thought" });
+      break;
+    case "STEP_DONE":
+    case "SCREEN_ANALYZING":
+    case "SCREEN_ANALYZED":
+    case "PERCEIVING":
+    case "ACTION_DENIED":
+    case "TASK_DISPATCHED":
+    case "FIELD_QUESTION":
+      // Forward these as AGENT_EVENT so robot.js can handle them
+      sendToRobot(tid, { type: "AGENT_EVENT", event });
+      break;
+  }
 }
 
 // ---- Gemini Live WebSocket ----
@@ -113,6 +202,23 @@ function connectGeminiLive(gKey) {
       broadcastRaw({ type: "SERVER_MESSAGE", data: text });
       // Parse for [INTENT:], [RECORD_START], [RECORD_STOP]
       handleGeminiLiveMessage(text);
+      // If mic was started from the robot content script (sidepanel not involved),
+      // parse audio chunks out of the message and forward them to that tab so the
+      // robot can play Gemini's voice locally.
+      if (robotMicTabId) {
+        try {
+          const parsed = JSON.parse(text);
+          const parts = parsed?.serverContent?.modelTurn?.parts || [];
+          for (const part of parts) {
+            if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
+              chrome.tabs.sendMessage(robotMicTabId, {
+                type: "ROBOT_AUDIO",
+                data: part.inlineData.data
+              }).catch(() => {});
+            }
+          }
+        } catch (_) {}
+      }
     } catch (e) { console.error("BG: Gemini parse error", e); }
   };
 
@@ -1153,6 +1259,7 @@ async function runOrchestrator(intentText, currentTab) {
 
 - taskType: "simple" | "multi-step" | "multi-tab-parallel" | "workflow-replay"
 - skill: matching skill name or null
+- startUrl: the full URL to navigate to BEFORE starting (include whenever the task clearly requires a specific website the user is NOT currently on — e.g. "book flights" → "https://www.google.com/flights"). Omit or null if the current page is already the right place.
 - steps: ALWAYS include 2-5 ordered steps describing what you will do, even for simple tasks. E.g. ["Navigate to Perplexity.ai", "Enter the research query", "Extract key findings and sources"]
 - parallelSubtasks: [{subGoal, startUrl}] for multi-tab-parallel only
 - workflowName: string for workflow-replay only
@@ -1191,6 +1298,17 @@ AI TOOL ROUTING — for these tasks, ALWAYS prefer the specialized skill listed:
 - "design", "UI mockup", "landing page design", "app design", "interface" → skill: design-stitch
 - "fill this form", "apply", "sign up", "register", "checkout form" → skill: form-fill
 
+SITE ROUTING — when no skill matches but the task clearly requires a specific site, set startUrl and taskType: "multi-step":
+- "book flight", "flight ticket", "fly to", "search flights", "cheap flights", "flight from" → startUrl: "https://www.google.com/flights"
+- "book train", "train ticket", "irctc", "rail ticket" → startUrl: "https://www.irctc.co.in"
+- "book hotel", "hotel booking", "find hotel", "stay in", "accommodation" → startUrl: "https://www.booking.com"
+- "book bus", "bus ticket" → startUrl: "https://www.redbus.in"
+- "food delivery", "order food", "zomato", "swiggy" → startUrl: "https://www.zomato.com"
+- "cab", "uber", "ola", "taxi" → startUrl: "https://www.olacabs.com"
+- "movie ticket", "book movie" → startUrl: "https://in.bookmyshow.com"
+
+CURRENT PAGE AWARENESS: If the current URL is already on the right site for the task, do NOT set startUrl. If it is on a completely unrelated page (e.g., user is on deepseek.com but wants to book flights), always set startUrl to the correct site.
+
 The vision agent handles all navigation — just describe WHAT to do.
 Return ONLY valid JSON.`;
 
@@ -1212,6 +1330,14 @@ Page title: ${currentTab?.title || "unknown"}`;
     // Fallback: treat as simple task
     return { taskType: "simple", skill: null, steps: [], parallelSubtasks: [] };
   }
+}
+
+// Helper: run a promise with a timeout (returns null on timeout)
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise.catch(() => null),
+    new Promise((resolve) => setTimeout(() => resolve(null), ms))
+  ]);
 }
 
 // ---- Vision Action Agent Loop ----
@@ -1258,10 +1384,11 @@ HOW TO USE THE ELEMENT LIST:
 - NEVER copy x,y coordinates into your actions — use the index number only
 - The (x:, y:) shown are for visual reference only
 
-NAVIGATION:
-- Task needs a different site → FIRST action MUST be {"type":"navigate","url":"https://full-url.com"}
-- NEVER click the browser address bar — use navigate action only
-- NEVER use the current page's search bar to go to a different website
+NAVIGATION — READ CAREFULLY:
+- Check CURRENT URL before every round. If it is NOT the right site for the task, your VERY FIRST action MUST be {"type":"navigate","url":"https://correct-site.com"} — no exceptions.
+- NEVER type into or click any element on a page that is unrelated to the task. If you are on deepseek.com, google.com, reddit.com, or ANY page that is not the booking/shopping/service site the task requires, navigate away immediately.
+- NEVER use the current page's search bar to navigate to a different website — use the navigate action only.
+- NEVER click the browser address bar — always use the navigate action.
 
 WAITING FOR AI GENERATION:
 - After triggering generation (Gamma slides, Perplexity search, etc.), use {"type":"wait","ms":5000}
@@ -1977,6 +2104,26 @@ async function dispatchTask(intentText, currentTab) {
   const fastSkill = inferSkillFromIntent(intentText);
   if (fastSkill) {
     console.log("BG: Fast-path skill:", fastSkill, "for:", intentText.slice(0, 80));
+    // Best-effort: ask the orchestrator to confirm or override the fast-path choice,
+    // but don't block the user for long. If orchestrator responds quickly and
+    // suggests a different skill, prefer that decision.
+    let orchestratorDecision = null;
+    try {
+      orchestratorDecision = await withTimeout(runOrchestrator(intentText, currentTab), 1400);
+    } catch (e) {
+      console.warn("BG: quick orchestrator check failed:", e?.message || e);
+      orchestratorDecision = null;
+    }
+
+    if (orchestratorDecision && orchestratorDecision.skill && orchestratorDecision.skill !== fastSkill) {
+      console.log("BG: Orchestrator overrode fast-skill:", orchestratorDecision.skill, "replacing", fastSkill);
+      const planText = orchestratorDecision.planSummary || `Working on: ${intentText}`;
+      broadcastEvent({ type: "PLAN_ANNOUNCED", steps: orchestratorDecision.steps, planText });
+      sendToGeminiLive(`[STATUS: ${planText}]`);
+      await executePlan(orchestratorDecision, intentText, currentTab);
+      return;
+    }
+
     const planText = `On it — using ${fastSkill}.`;
     broadcastEvent({ type: "PLAN_ANNOUNCED", planText });
     sendToGeminiLive(`[STATUS: Starting now.]`);
@@ -2084,6 +2231,24 @@ async function executePlan(decision, intentText, currentTab) {
       broadcastEvent({ type: "TASK_FAILED", error: "No active tab" });
       sendToGeminiLive("[TASK_FAILED: No active tab found]");
       return;
+    }
+
+    // Pre-navigate for non-skill tasks when orchestrator says the current page is wrong
+    if (!skill && decision.startUrl) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const targetHost = new URL(decision.startUrl).hostname.replace(/^www\./, "");
+        if (!(tab.url || "").includes(targetHost)) {
+          console.log("BG: Pre-navigating non-skill task to:", decision.startUrl);
+          broadcastEvent({ type: "EXECUTING", tabId, action: { type: "navigate", url: decision.startUrl }, elementName: `Navigating to ${decision.startUrl}` });
+          await executeCdpAction(tabId, { type: "navigate", url: decision.startUrl }, new Map());
+          await waitForPageSettle(tabId);
+          await sleep(NAVIGATE_SETTLE_MS);
+          broadcastEvent({ type: "ACTION_VERIFIED", tabId, action: { type: "navigate", url: decision.startUrl } });
+        }
+      } catch (e) {
+        console.warn("BG: pre-navigate failed, agent will handle navigation:", e.message);
+      }
     }
 
     // Helper: run agent and handle errors cleanly
@@ -2305,6 +2470,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "START_MIC") {
+    // If sent from a content script (robot), track the tab for robot forwarding
+    if (sender?.tab?.id) {
+      currentAgentTabId = sender.tab.id;
+      robotMicTabId = sender.tab.id; // enable audio forwarding to this tab
+      console.log("BG: START_MIC from robot in tab", sender.tab.id);
+    } else {
+      robotMicTabId = null; // sidepanel handles its own audio
+    }
     ensureOffscreen().then(() => {
       setTimeout(() => {
         chrome.runtime.sendMessage({ type: "OFFSCREEN_START_MIC" }).catch(() => { });
@@ -2315,6 +2488,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "STOP_MIC") {
+    robotMicTabId = null; // stop forwarding audio to robot
     chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP_MIC" }).catch(() => { });
     setTimeout(() => closeOffscreen(), 500);
     if (geminiSocket?.readyState === WebSocket.OPEN) {

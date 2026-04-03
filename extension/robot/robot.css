@@ -1,0 +1,475 @@
+/* robot/robot.css — Loaded into Shadow DOM. Styles the roaming robot overlay. */
+
+/* ── RESET ──────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── SHADOW HOST ─────────────────────────────────────────────────────────── */
+:host {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+  overflow: visible !important;
+  display: block !important;
+}
+
+/* ── OVERLAY ROOT ─────────────────────────────────────────────────────────── */
+#ctrl-root {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* ── ROBOT CONTAINER ─────────────────────────────────────────────────────── */
+#ctrl-robot {
+  position: absolute;
+  top: 0; left: 0;
+  width: 110px;
+  will-change: transform;
+  pointer-events: none;
+}
+
+#ctrl-flip {
+  will-change: transform;
+}
+
+/* ── SVG WALK GROUP PIVOTS ────────────────────────────────────────────────── */
+#leg-l, #leg-r {
+  transform-box: fill-box;
+  transform-origin: top center;
+}
+#arm-l, #arm-r {
+  transform-box: fill-box;
+  transform-origin: top center;
+}
+#head-grp {
+  transform-box: fill-box;
+  transform-origin: 60px 55px;
+}
+#eye-l, #eye-r {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+#acc-bulb {
+  transform-box: fill-box;
+  transform-origin: 88px -10px;
+}
+
+/* ── MOUTH EXPRESSIONS ────────────────────────────────────────────────────── */
+.mx { display: none; }
+.mx.smile { display: block; } /* default */
+
+#ctrl-root[data-state="listening"]  .mx.smile { display: none; }
+#ctrl-root[data-state="listening"]  .mx.open  { display: block; }
+#ctrl-root[data-state="thinking"]   .mx.smile { display: none; }
+#ctrl-root[data-state="thinking"]   .mx.think { display: block; }
+#ctrl-root[data-state="acting"]     .mx.smile { display: none; }
+#ctrl-root[data-state="acting"]     .mx.determined { display: block; }
+#ctrl-root[data-state="error"]      .mx.smile { display: none; }
+#ctrl-root[data-state="error"]      .mx.sad   { display: block; }
+#ctrl-root[data-state="sad"]        .mx.smile { display: none; }
+#ctrl-root[data-state="sad"]        .mx.sad   { display: block; }
+
+/* ── CHEST STATE PANELS ───────────────────────────────────────────────────── */
+.cst { display: none; }
+.idle-chest { display: block; }
+
+#ctrl-root[data-state="listening"] .idle-chest   { display: none; }
+#ctrl-root[data-state="listening"] .listen-chest { display: block; }
+#ctrl-root[data-state="thinking"]  .idle-chest   { display: none; }
+#ctrl-root[data-state="thinking"]  .think-chest  { display: block; }
+#ctrl-root[data-state="acting"]    .idle-chest   { display: none; }
+#ctrl-root[data-state="acting"]    .act-chest    { display: block; }
+#ctrl-root[data-state="error"]     .idle-chest   { display: none; }
+#ctrl-root[data-state="error"]     .err-chest    { display: block; }
+#ctrl-root[data-state="sad"]       .idle-chest   { display: none; }
+#ctrl-root[data-state="sad"]       .sad-chest    { display: block; }
+
+/* ── KEYFRAMES ────────────────────────────────────────────────────────────── */
+
+@keyframes idle-bob {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-7px); }
+}
+@keyframes ant-slow {
+  0%, 100% { opacity: 0.5; }
+  50%       { opacity: 1; }
+}
+@keyframes ant-fast {
+  0%, 100% { opacity: 0.6; }
+  50%       { opacity: 1; }
+}
+@keyframes blink {
+  0%, 87%, 100% { transform: scaleY(1); }
+  93%           { transform: scaleY(0.06); }
+}
+@keyframes bar-wave {
+  from { transform: scaleY(0.2); }
+  to   { transform: scaleY(1); }
+}
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.2; transform: scale(0.7); }
+  50%       { opacity: 1;   transform: scale(1.25); }
+}
+@keyframes err-slump {
+  from { transform: rotate(0deg) translateY(0); }
+  to   { transform: rotate(-4deg) translateY(5px); }
+}
+@keyframes q-float {
+  0%, 100% { transform: translateY(0);   opacity: 1; }
+  50%       { transform: translateY(-7px); opacity: 0.6; }
+}
+@keyframes speed-slide {
+  from { transform: translateX(0);    opacity: 0.9; }
+  to   { transform: translateX(-14px); opacity: 0; }
+}
+@keyframes star-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes rocket-flicker {
+  0%, 100% { opacity: 0.9; }
+  50%       { opacity: 0.55; }
+}
+@keyframes glow-ring {
+  0%   { transform: scale(1);   opacity: 0.85; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+@keyframes mic-pulse {
+  0%   { box-shadow: 0 0 0 0 #4ade8060; }
+  70%  { box-shadow: 0 0 0 10px #4ade8000; }
+  100% { box-shadow: 0 0 0 0 #4ade8000; }
+}
+@keyframes mic-pulse-purple {
+  0%   { box-shadow: 0 0 0 0 #818cf860; }
+  70%  { box-shadow: 0 0 0 10px #818cf800; }
+  100% { box-shadow: 0 0 0 0 #818cf800; }
+}
+
+/* ── IDLE STATE ───────────────────────────────────────────────────────────── */
+#ctrl-root[data-state="idle"] #ctrl-svg {
+  animation: idle-bob 3.6s ease-in-out infinite;
+  filter: drop-shadow(0 6px 18px rgba(129,140,248,.1));
+}
+#ctrl-root[data-state="idle"] #antenna {
+  fill: #818cf8;
+  animation: ant-slow 2.6s ease-in-out infinite;
+}
+#ctrl-root[data-state="idle"] #eye-l  { animation: blink 5.2s ease-in-out infinite; }
+#ctrl-root[data-state="idle"] #eye-r  { animation: blink 5.2s ease-in-out 0.22s infinite; }
+#ctrl-root[data-state="idle"] #pup-l,
+#ctrl-root[data-state="idle"] #pup-r  { fill: #818cf8; }
+
+/* ── LISTENING STATE ──────────────────────────────────────────────────────── */
+#ctrl-root[data-state="listening"] #ctrl-svg {
+  filter: drop-shadow(0 6px 24px rgba(74,222,128,.28));
+}
+#ctrl-root[data-state="listening"] #antenna {
+  fill: #4ade80;
+  animation: ant-fast 0.48s ease-in-out infinite;
+}
+#ctrl-root[data-state="listening"] #eye-l,
+#ctrl-root[data-state="listening"] #eye-r  { animation: none; transform: scaleY(1.18); }
+#ctrl-root[data-state="listening"] #pup-l,
+#ctrl-root[data-state="listening"] #pup-r  { fill: #4ade80; }
+/* Sound bars animate */
+#ctrl-root[data-state="listening"] .bar    { animation: bar-wave 0.52s ease-in-out infinite alternate; }
+#ctrl-root[data-state="listening"] .bar.b2 { animation-delay: 0.09s; }
+#ctrl-root[data-state="listening"] .bar.b3 { animation-delay: 0.18s; }
+#ctrl-root[data-state="listening"] .bar.b4 { animation-delay: 0.27s; }
+
+/* ── THINKING STATE ───────────────────────────────────────────────────────── */
+#ctrl-root[data-state="thinking"] #ctrl-svg {
+  filter: drop-shadow(0 6px 24px rgba(167,139,250,.28));
+}
+#ctrl-root[data-state="thinking"] #antenna {
+  fill: #a78bfa;
+  animation: ant-fast 0.85s ease-in-out infinite;
+}
+#ctrl-root[data-state="thinking"] #eye-l,
+#ctrl-root[data-state="thinking"] #eye-r  { animation: none; }
+#ctrl-root[data-state="thinking"] #pup-l,
+#ctrl-root[data-state="thinking"] #pup-r  { fill: #a78bfa; }
+#ctrl-root[data-state="thinking"] #acc-questions { animation: q-float 2.1s ease-in-out infinite; }
+/* Thinking dots */
+#ctrl-root[data-state="thinking"] .cdot    { animation: dot-pulse 1.3s ease-in-out infinite; }
+#ctrl-root[data-state="thinking"] .cdot.d2 { animation-delay: 0.43s; }
+#ctrl-root[data-state="thinking"] .cdot.d3 { animation-delay: 0.86s; }
+
+/* ── ACTING STATE ─────────────────────────────────────────────────────────── */
+#ctrl-root[data-state="acting"] #ctrl-svg {
+  filter: drop-shadow(0 6px 28px rgba(249,115,22,.32));
+}
+#ctrl-root[data-state="acting"] #antenna {
+  fill: #f97316;
+  animation: ant-fast 0.28s ease-in-out infinite;
+}
+#ctrl-root[data-state="acting"] #eye-l,
+#ctrl-root[data-state="acting"] #eye-r   { animation: none; transform: scaleY(0.76); }
+#ctrl-root[data-state="acting"] #pup-l,
+#ctrl-root[data-state="acting"] #pup-r   { fill: #f97316; }
+#ctrl-root[data-state="acting"] #acc-speed  { animation: speed-slide 0.5s ease-in-out infinite alternate; }
+#ctrl-root[data-state="acting"] #acc-rocket { animation: rocket-flicker 0.33s ease-in-out infinite; }
+
+/* ── ERROR STATE ──────────────────────────────────────────────────────────── */
+#ctrl-root[data-state="error"] #ctrl-svg {
+  animation: err-slump 0.32s ease-out forwards;
+  filter: drop-shadow(0 6px 24px rgba(248,113,113,.38));
+}
+#ctrl-root[data-state="error"] #antenna {
+  fill: #f87171;
+  animation: none;
+  opacity: 0.32;
+}
+#ctrl-root[data-state="error"] #eye-l,
+#ctrl-root[data-state="error"] #eye-r   { animation: none; transform: scaleY(0.58); }
+#ctrl-root[data-state="error"] #pup-l,
+#ctrl-root[data-state="error"] #pup-r   { fill: #f87171; }
+#ctrl-root[data-state="error"] #acc-stars {
+  animation: star-spin 2s linear infinite;
+}
+
+/* ── SPEECH BUBBLE ────────────────────────────────────────────────────────── */
+#ctrl-bubble {
+  position: absolute;
+  width: 205px;
+  pointer-events: none;
+  font-family: system-ui, -apple-system, sans-serif;
+  z-index: 2;
+}
+
+#ctrl-bubble-body {
+  background: #12122a;
+  border: 2px solid #26264e;
+  border-radius: 16px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #e2e8f0;
+  min-height: 38px;
+  word-break: break-word;
+  box-shadow: 0 6px 28px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.04);
+}
+
+/* Bubble type variants */
+#ctrl-bubble[data-type="thought"] #ctrl-bubble-body {
+  background: #16163a;
+  border-color: #a78bfa33;
+  color: #c4b5fd;
+  font-style: italic;
+  border-radius: 40% 50% 45% 50% / 50% 50% 50% 60%;
+  padding: 12px 16px;
+}
+#ctrl-bubble[data-type="shout"] #ctrl-bubble-body {
+  background: #0e2215;
+  border-color: #4ade80;
+  color: #bbf7d0;
+  font-weight: 700;
+  font-size: 13.5px;
+  box-shadow: 0 0 20px rgba(74,222,128,.25), 0 6px 28px rgba(0,0,0,.5);
+}
+#ctrl-bubble[data-type="action"] #ctrl-bubble-body {
+  background: #1e1508;
+  border-color: #f97316aa;
+  color: #fed7aa;
+  font-size: 11.5px;
+}
+
+/* Bubble tail */
+#ctrl-bubble-tail {
+  position: absolute;
+  width: 0; height: 0;
+}
+
+/* Right-side tail — robot is left of bubble */
+#ctrl-bubble[data-side="right"] #ctrl-bubble-tail {
+  left: -13px; top: 16px;
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+  border-right: 13px solid #26264e;
+}
+#ctrl-bubble[data-side="right"] #ctrl-bubble-body { border-top-left-radius: 4px; }
+
+/* Left-side tail — robot is right of bubble */
+#ctrl-bubble[data-side="left"] #ctrl-bubble-tail {
+  right: -13px; top: 16px;
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+  border-left: 13px solid #26264e;
+}
+#ctrl-bubble[data-side="left"] #ctrl-bubble-body { border-top-right-radius: 4px; }
+
+/* Top tail — robot is below bubble */
+#ctrl-bubble[data-side="top"] #ctrl-bubble-tail {
+  bottom: -13px;
+  left: 50%; transform: translateX(-50%);
+  border-left: 9px solid transparent;
+  border-right: 9px solid transparent;
+  border-top: 13px solid #26264e;
+}
+
+/* Thought bubble gets cloud circles instead of triangle */
+#ctrl-bubble[data-type="thought"] #ctrl-bubble-tail {
+  border: none;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #26264e;
+  left: -13px; top: 14px;
+}
+#ctrl-bubble[data-type="thought"] #ctrl-bubble-tail::before {
+  content: '';
+  position: absolute;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #26264e;
+  left: -9px; top: 7px;
+}
+#ctrl-bubble[data-type="thought"] #ctrl-bubble-tail::after {
+  content: '';
+  position: absolute;
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: #26264e;
+  left: -15px; top: 12px;
+}
+
+/* ── MIC PILL ─────────────────────────────────────────────────────────────── */
+#ctrl-mic {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 13px 7px 10px;
+  background: #10101e;
+  border: 2px solid #22223e;
+  border-radius: 50px;
+  cursor: pointer;
+  color: #3a3a6a;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  user-select: none;
+  will-change: transform;
+  transition: border-color .2s, color .2s;
+  box-shadow: 0 2px 12px rgba(0,0,0,.4);
+}
+#ctrl-mic:hover {
+  border-color: #818cf8;
+  color: #818cf8;
+}
+#ctrl-mic[data-active="true"] {
+  border-color: #4ade80;
+  color: #4ade80;
+  animation: mic-pulse 1.3s ease-out infinite;
+}
+#ctrl-mic-lbl { pointer-events: none; }
+
+#ctrl-mic-ring {
+  position: absolute;
+  inset: -5px;
+  border-radius: 50px;
+  pointer-events: none;
+}
+#ctrl-mic[data-active="true"] #ctrl-mic-ring {
+  border: 2px solid #4ade8030;
+  animation: glow-ring 1.3s ease-out infinite;
+}
+
+/* ── SAD STATE ────────────────────────────────────────────────────────────── */
+@keyframes sad-droop {
+  0%   { transform: translateY(0) rotate(0deg); }
+  100% { transform: translateY(8px) rotate(-6deg); }
+}
+@keyframes tear-fall {
+  0%, 60% { transform: translateY(0); opacity: 0.8; }
+  100%    { transform: translateY(16px); opacity: 0; }
+}
+#ctrl-root[data-state="sad"] #ctrl-svg {
+  filter: drop-shadow(0 4px 12px rgba(148,163,184,.2)) saturate(0.6);
+}
+#ctrl-root[data-state="sad"] #antenna {
+  fill: #94a3b8;
+  animation: none;
+  opacity: 0.35;
+}
+#ctrl-root[data-state="sad"] #pup-l,
+#ctrl-root[data-state="sad"] #pup-r  { fill: #94a3b8; }
+#ctrl-root[data-state="sad"] #acc-tears { animation: tear-fall 1.8s ease-in infinite; }
+
+/* ── THINKING BULB GLOW ───────────────────────────────────────────────────── */
+@keyframes bulb-think-pulse {
+  0%, 100% { opacity: 0.6; filter: drop-shadow(0 0 4px #fef08a66); }
+  50%      { opacity: 1;   filter: drop-shadow(0 0 14px #fef08acc); }
+}
+#ctrl-root[data-state="thinking"] #acc-bulb {
+  animation: bulb-think-pulse 1.8s ease-in-out infinite;
+}
+
+/* ── BUBBLE ICON ──────────────────────────────────────────────────────────── */
+#ctrl-bubble-icon {
+  font-size: 14px;
+  line-height: 1;
+  margin-bottom: 4px;
+  display: none;
+}
+
+/* ── DRAGGING cursor on robot body ──────────────────────────────────────── */
+#ctrl-robot { cursor: grab; }
+#ctrl-robot:active { cursor: grabbing; }
+
+/* ── STOP BUTTON ──────────────────────────────────────────────────────────── */
+#ctrl-stop {
+  position: absolute;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity .15s, transform .15s;
+  user-select: none;
+  pointer-events: none;
+  background: #3b0a0a;
+  border: 1.5px solid #f87171;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#ctrl-stop:hover { opacity: 1; transform: scale(1.2); }
+@keyframes stop-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 #f8717180; }
+  70%       { box-shadow: 0 0 0 6px #f8717100; }
+}
+#ctrl-stop[style*="block"] { animation: stop-pulse 1.4s ease-out infinite; }
+
+/* ── MUTE BUTTON ──────────────────────────────────────────────────────────── */
+#ctrl-mute {
+  position: absolute;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity .2s, transform .15s;
+  user-select: none;
+  pointer-events: none; /* set to auto in JS */
+  /* Positioned by JS alongside the mic pill */
+}
+#ctrl-mute:hover { opacity: 0.9; transform: scale(1.18); }
+#ctrl-mute.active {
+  opacity: 1;
+  animation: mute-pulse 2s ease-in-out infinite;
+}
+@keyframes mute-pulse {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.12); }
+}
+
+/* When muted: ghost the robot slightly */
+#ctrl-root[data-muted="true"] #ctrl-svg {
+  opacity: 0.45;
+  filter: saturate(0.2) drop-shadow(0 3px 8px rgba(0,0,0,.2));
+}

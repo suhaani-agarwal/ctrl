@@ -1,14 +1,20 @@
+/* ============================================================
+   CTRL — Robot UI Stylesheet
+   ============================================================ */
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
   font-family: system-ui, -apple-system, sans-serif;
-  background: #0f0f0f;
+  background: #0c0c1a;
   color: #e8e8e8;
   height: 100vh;
   overflow: hidden;
 }
 
-/* ---- Layout ---- */
+/* ============================================================
+   PANEL LAYOUT
+   ============================================================ */
 #panel {
   display: flex;
   flex-direction: column;
@@ -16,50 +22,59 @@ body {
   position: relative;
 }
 
-/* ---- Header ---- */
-header {
+/* ============================================================
+   TOP BAR
+   ============================================================ */
+#top-bar {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 11px 14px;
-  background: #161616;
-  border-bottom: 1px solid #252525;
+  padding: 9px 12px;
+  background: #10101e;
+  border-bottom: 1px solid #1e1e36;
   flex-shrink: 0;
+  z-index: 10;
 }
 
 .agent-name {
   font-size: 15px;
   font-weight: 700;
   color: #818cf8;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
   margin-right: auto;
 }
 
-/* Status badge */
-.badge {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+#top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
-.badge.idle     { background: #1e1e2e; color: #666; border: 1px solid #333; }
-.badge.listening{ background: #1a2a1a; color: #4ade80; border: 1px solid #4ade80; animation: pulse 1.5s infinite; }
-.badge.thinking { background: #1a1a2e; color: #818cf8; border: 1px solid #818cf8; animation: pulse 1.2s infinite; }
-.badge.acting   { background: #2a1a1a; color: #f97316; border: 1px solid #f97316; }
-.badge.error    { background: #2a1a1a; color: #f87171; border: 1px solid #f87171; }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
+/* JS still updates this, but it's invisible */
+#status-badge { display: none !important; }
+
+.icon-btn {
+  background: none;
+  border: 1px solid #252542;
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+  color: #4a4a70;
+  transition: border-color 0.15s, color 0.15s;
 }
+.icon-btn:hover { border-color: #818cf8; color: #818cf8; }
+.icon-btn.active { border-color: #ef4444; color: #ef4444; }
 
 .abort-btn {
   font-size: 11px;
   font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 5px;
+  padding: 4px 10px;
+  border-radius: 6px;
   border: 1px solid #ef4444;
   background: transparent;
   color: #ef4444;
@@ -68,28 +83,367 @@ header {
 }
 .abort-btn:hover { background: #ef4444; color: #fff; }
 
-/* ---- Task card ---- */
+/* ============================================================
+   ROBOT SECTION
+   ============================================================ */
+#robot-section {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 6px;
+}
+
+#robot-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+#robot-svg {
+  width: 116px;
+  height: auto;
+  filter: drop-shadow(0 4px 18px #818cf820);
+  transition: filter 0.4s;
+}
+
+/* ============================================================
+   ROBOT ANIMATIONS — KEYFRAMES
+   ============================================================ */
+
+/* Gentle idle float */
+@keyframes robot-bob {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-6px); }
+}
+
+/* Energetic listen lean */
+@keyframes robot-listen {
+  0%, 100% { transform: translateY(-3px) scale(1.02); }
+  50%       { transform: translateY(-6px) scale(1.02); }
+}
+
+/* Dreamy think sway */
+@keyframes robot-sway {
+  0%, 100% { transform: rotate(-2.5deg) translateY(-2px); }
+  50%       { transform: rotate(2.5deg)  translateY(-2px); }
+}
+
+/* Excited act bounce */
+@keyframes robot-bounce {
+  0%, 100% { transform: translateY(0)   scaleY(1)    scaleX(1); }
+  40%       { transform: translateY(-10px) scaleY(1.04) scaleX(0.98); }
+  70%       { transform: translateY(-2px)  scaleY(0.97) scaleX(1.01); }
+}
+
+/* Eye blink */
+@keyframes blink {
+  0%, 88%, 100% { transform: scaleY(1); }
+  93%           { transform: scaleY(0.06); }
+}
+
+/* Look upward (thinking) */
+@keyframes look-up {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-2.5px); }
+}
+
+/* Antenna glow */
+@keyframes antenna-slow {
+  0%, 100% { opacity: 0.55; }
+  50%       { opacity: 1; }
+}
+@keyframes antenna-fast {
+  0%, 100% { opacity: 0.65; }
+  50%       { opacity: 1; }
+}
+
+/* Arm swing */
+@keyframes arm-l-swing {
+  from { transform: rotate(-20deg); }
+  to   { transform: rotate(10deg);  }
+}
+@keyframes arm-r-swing {
+  from { transform: rotate(20deg);  }
+  to   { transform: rotate(-10deg); }
+}
+
+/* Chest bar wave */
+@keyframes bar-wave {
+  from { transform: scaleY(0.2); }
+  to   { transform: scaleY(1);   }
+}
+
+/* Chest dot pulse */
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.2; transform: scale(0.7);  }
+  50%       { opacity: 1;   transform: scale(1.25); }
+}
+
+/* ============================================================
+   ROBOT ANIMATIONS — STATE: IDLE (default)
+   ============================================================ */
+#robot-wrap #robot-svg {
+  animation: robot-bob 3.2s ease-in-out infinite;
+}
+#robot-wrap #antenna-tip {
+  fill: #818cf8;
+  animation: antenna-slow 2.2s ease-in-out infinite;
+}
+#robot-wrap .eye-group {
+  animation: blink 5s ease-in-out infinite;
+}
+#robot-wrap .eye-right {
+  animation-delay: 0.18s;
+}
+#robot-wrap #pupil-left,
+#robot-wrap #pupil-right {
+  fill: #818cf8;
+  transition: fill 0.3s;
+}
+
+/* ============================================================
+   ROBOT ANIMATIONS — STATE: LISTENING
+   ============================================================ */
+#robot-wrap.state-listening #robot-svg {
+  animation: robot-listen 0.9s ease-in-out infinite;
+  filter: drop-shadow(0 4px 22px #4ade8040);
+}
+#robot-wrap.state-listening #antenna-tip {
+  fill: #4ade80;
+  animation: antenna-fast 0.45s ease-in-out infinite;
+}
+#robot-wrap.state-listening #pupil-left,
+#robot-wrap.state-listening #pupil-right { fill: #4ade80; }
+#robot-wrap.state-listening .eye-group   { animation: none; transform: scaleY(1.12); }
+
+/* ============================================================
+   ROBOT ANIMATIONS — STATE: THINKING
+   ============================================================ */
+#robot-wrap.state-thinking #robot-svg {
+  animation: robot-sway 2.1s ease-in-out infinite;
+  filter: drop-shadow(0 4px 22px #a78bfa40);
+}
+#robot-wrap.state-thinking #antenna-tip {
+  fill: #a78bfa;
+  animation: antenna-fast 0.8s ease-in-out infinite;
+}
+#robot-wrap.state-thinking #pupil-left,
+#robot-wrap.state-thinking #pupil-right {
+  fill: #a78bfa;
+  animation: look-up 1.6s ease-in-out infinite;
+}
+#robot-wrap.state-thinking .eye-group { animation: none; }
+
+/* ============================================================
+   ROBOT ANIMATIONS — STATE: ACTING
+   ============================================================ */
+#robot-wrap.state-acting #robot-svg {
+  animation: robot-bounce 0.42s ease-in-out infinite;
+  filter: drop-shadow(0 4px 26px #f9731650);
+}
+#robot-wrap.state-acting #antenna-tip {
+  fill: #f97316;
+  animation: antenna-fast 0.28s ease-in-out infinite;
+}
+#robot-wrap.state-acting #pupil-left,
+#robot-wrap.state-acting #pupil-right { fill: #f97316; }
+#robot-wrap.state-acting .eye-group   { animation: none; transform: scaleY(0.78); }
+#robot-wrap.state-acting #arm-left    { animation: arm-l-swing 0.42s ease-in-out infinite alternate; }
+#robot-wrap.state-acting #arm-right   { animation: arm-r-swing 0.42s ease-in-out infinite alternate; }
+
+/* ============================================================
+   ROBOT ANIMATIONS — STATE: ERROR
+   ============================================================ */
+#robot-wrap.state-error #robot-svg {
+  animation: none;
+  transform: rotate(-4deg) translateY(4px);
+  filter: drop-shadow(0 4px 22px #f8717150);
+}
+#robot-wrap.state-error #antenna-tip {
+  fill: #f87171;
+  animation: none;
+  opacity: 0.35;
+}
+#robot-wrap.state-error #pupil-left,
+#robot-wrap.state-error #pupil-right { fill: #f87171; }
+#robot-wrap.state-error .eye-group   { animation: none; transform: scaleY(0.65); }
+
+/* ============================================================
+   MOUTH EXPRESSIONS
+   ============================================================ */
+.mouth-expr { display: none; }
+
+/* idle / default */
+#robot-wrap                    .mouth-smile      { display: block; }
+
+/* listening */
+#robot-wrap.state-listening    .mouth-smile      { display: none; }
+#robot-wrap.state-listening    .mouth-open       { display: block; }
+
+/* thinking */
+#robot-wrap.state-thinking     .mouth-smile      { display: none; }
+#robot-wrap.state-thinking     .mouth-think      { display: block; }
+
+/* acting */
+#robot-wrap.state-acting       .mouth-smile      { display: none; }
+#robot-wrap.state-acting       .mouth-determined { display: block; }
+
+/* error */
+#robot-wrap.state-error        .mouth-smile      { display: none; }
+#robot-wrap.state-error        .mouth-sad        { display: block; }
+
+/* ============================================================
+   CHEST DISPLAY
+   ============================================================ */
+.chest-state { display: none; }
+
+#robot-wrap                  .chest-idle      { display: block; }
+#robot-wrap.state-listening  .chest-idle      { display: none; }
+#robot-wrap.state-listening  .chest-listening { display: block; }
+#robot-wrap.state-thinking   .chest-idle      { display: none; }
+#robot-wrap.state-thinking   .chest-thinking  { display: block; }
+#robot-wrap.state-acting     .chest-idle      { display: none; }
+#robot-wrap.state-acting     .chest-acting    { display: block; }
+#robot-wrap.state-error      .chest-idle      { display: none; }
+#robot-wrap.state-error      .chest-error     { display: block; }
+
+/* Sound bars */
+#robot-wrap.state-listening .chest-listening .bar {
+  animation: bar-wave 0.5s ease-in-out infinite alternate;
+}
+#robot-wrap.state-listening .chest-listening .bar2 { animation-delay: 0.08s; }
+#robot-wrap.state-listening .chest-listening .bar3 { animation-delay: 0.16s; }
+#robot-wrap.state-listening .chest-listening .bar4 { animation-delay: 0.24s; }
+
+/* Thinking dots */
+#robot-wrap.state-thinking .chest-thinking .dot  { animation: dot-pulse 1.3s ease-in-out infinite; }
+#robot-wrap.state-thinking .chest-thinking .dot2 { animation-delay: 0.43s; }
+#robot-wrap.state-thinking .chest-thinking .dot3 { animation-delay: 0.86s; }
+
+/* ============================================================
+   MIC BUTTON
+   ============================================================ */
+#mic-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.mic-label {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: #2e2e4a;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.mic-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 2px solid #252542;
+  background: #12121e;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #44446a;
+  transition: border-color 0.2s, color 0.2s, box-shadow 0.2s, background 0.2s;
+}
+.mic-btn:hover {
+  border-color: #818cf8;
+  color: #818cf8;
+  box-shadow: 0 0 16px #818cf830;
+}
+.mic-btn.mic-on {
+  background: #1a1a38;
+  border-color: #818cf8;
+  color: #818cf8;
+  box-shadow: 0 0 0 6px #818cf820, 0 0 24px #818cf840;
+  animation: mic-ring 1.5s ease-in-out infinite;
+}
+.mic-btn.mic-listening {
+  background: #0e2a1a;
+  border-color: #4ade80;
+  color: #4ade80;
+  box-shadow: 0 0 0 6px #4ade8025, 0 0 28px #4ade8060;
+  animation: mic-ring-green 1s ease-in-out infinite;
+}
+
+@keyframes mic-ring {
+  0%, 100% { box-shadow: 0 0 0 0   #818cf830, 0 0 24px #818cf840; }
+  50%       { box-shadow: 0 0 0 10px #818cf800, 0 0 24px #818cf840; }
+}
+@keyframes mic-ring-green {
+  0%, 100% { box-shadow: 0 0 0 0   #4ade8040, 0 0 28px #4ade8060; }
+  50%       { box-shadow: 0 0 0 12px #4ade8000, 0 0 28px #4ade8060; }
+}
+
+/* ============================================================
+   THINK BUBBLE
+   ============================================================ */
+#think-bubble {
+  flex: 1 1 0;
+  margin: 0 10px 10px;
+  background: #0f0f1e;
+  border: 2px solid #1e1e38;
+  border-radius: 18px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Triangle tail pointing up toward robot */
+#think-bubble::before {
+  content: '';
+  position: absolute;
+  top: -13px;
+  left: 42px;
+  width: 0;
+  height: 0;
+  border-left:  11px solid transparent;
+  border-right: 11px solid transparent;
+  border-bottom: 13px solid #1e1e38;
+  z-index: 1;
+}
+#think-bubble::after {
+  content: '';
+  position: absolute;
+  top: -10px;
+  left: 43px;
+  width: 0;
+  height: 0;
+  border-left:  10px solid transparent;
+  border-right: 10px solid transparent;
+  border-bottom: 11px solid #0f0f1e;
+  z-index: 2;
+}
+
+/* ============================================================
+   TASK CARD (inside think bubble)
+   ============================================================ */
 #task-card {
   padding: 8px 14px;
-  background: #151520;
-  border-bottom: 1px solid #252535;
+  background: #14142a;
+  border-bottom: 1px solid #1e1e38;
   flex-shrink: 0;
   font-size: 12px;
 }
-
 #task-text {
-  color: #c8c8d8;
+  color: #c8c8e0;
   margin-bottom: 5px;
   line-height: 1.4;
 }
-
 #task-meta {
   display: flex;
   gap: 6px;
   align-items: center;
   flex-wrap: wrap;
 }
-
 .skill-tag {
   font-size: 10px;
   font-weight: 700;
@@ -101,19 +455,8 @@ header {
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
-
-.step-tag {
-  font-size: 10px;
-  color: #666;
-}
-
-#tab-badges {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-  margin-top: 3px;
-}
-
+.step-tag { font-size: 10px; color: #555; }
+#tab-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
 .tab-badge {
   font-size: 10px;
   padding: 1px 7px;
@@ -123,7 +466,9 @@ header {
   border: 1px solid #60a5fa44;
 }
 
-/* ---- Transcript (conversation bubbles) ---- */
+/* ============================================================
+   TRANSCRIPT (conversation bubbles)
+   ============================================================ */
 #transcript {
   flex: 1 1 0;
   overflow-y: auto;
@@ -135,145 +480,42 @@ header {
 }
 
 .bubble {
-  max-width: 85%;
+  max-width: 88%;
   padding: 8px 12px;
-  border-radius: 12px;
+  border-radius: 14px;
   font-size: 13px;
   line-height: 1.5;
   word-break: break-word;
 }
-
 .bubble.user {
   align-self: flex-end;
-  background: #1e2040;
+  background: #1e2042;
   color: #c7d2fe;
-  border-bottom-right-radius: 3px;
+  border-bottom-right-radius: 4px;
+  border: 1px solid #2a2a5a;
 }
-
 .bubble.agent {
   align-self: flex-start;
-  background: #1a1a1a;
-  color: #d4d4d8;
-  border-bottom-left-radius: 3px;
-  border: 1px solid #2a2a2a;
+  background: #171726;
+  color: #d4d4e8;
+  border-bottom-left-radius: 4px;
+  border: 1px solid #22223a;
 }
-
 .bubble.thought {
   align-self: flex-start;
   background: transparent;
-  color: #555;
+  color: #3a3a5a;
   font-style: italic;
   font-size: 11px;
   padding: 2px 6px;
   border: none;
 }
 
-/* ---- Action log ---- */
-#action-log-wrap {
-  flex-shrink: 0;
-  border-top: 1px solid #222;
-  max-height: 180px;
-  display: flex;
-  flex-direction: column;
-}
-
-#action-log-header {
-  font-size: 10px;
-  font-weight: 600;
-  color: #444;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 5px 12px 3px;
-  background: #121212;
-  flex-shrink: 0;
-}
-
-#action-log {
-  overflow-y: auto;
-  flex: 1;
-  padding: 4px 0;
-}
-
-.log-entry {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 12px;
-  font-size: 11px;
-  line-height: 1.4;
-  border-bottom: 1px solid #1a1a1a;
-  transition: background 0.1s;
-}
-.log-entry:hover { background: #151515; }
-
-.log-icon { font-size: 12px; flex-shrink: 0; width: 16px; text-align: center; }
-.log-desc { color: #aaa; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log-time { color: #444; font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
-
-.log-entry.verified .log-desc { color: #4ade80; }
-.log-entry.failed   .log-desc { color: #f87171; }
-.log-entry.thinking .log-desc { color: #818cf8; }
-.log-entry.navigating .log-desc { color: #60a5fa; }
-
-/* ---- Footer ---- */
-footer {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  padding: 12px;
-  background: #111;
-  border-top: 1px solid #222;
-  flex-shrink: 0;
-}
-
-.icon-btn {
-  background: none;
-  border: 1px solid #2a2a2a;
-  border-radius: 50%;
-  width: 36px;
-  height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 14px;
-  color: #666;
-  transition: border-color 0.15s, color 0.15s;
-}
-.icon-btn:hover { border-color: #818cf8; color: #818cf8; }
-.icon-btn.active { border-color: #ef4444; color: #ef4444; }
-
-.mic-btn {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  border: 2px solid #333;
-  background: #1a1a1a;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #999;
-  transition: all 0.2s;
-}
-.mic-btn:hover { border-color: #818cf8; color: #818cf8; }
-.mic-btn.mic-on {
-  background: #1e1a40;
-  border-color: #818cf8;
-  color: #818cf8;
-  animation: pulse 1.5s infinite;
-}
-.mic-btn.mic-listening {
-  background: #1a2e1a;
-  border-color: #4ade80;
-  color: #4ade80;
-  animation: pulse 1s infinite;
-}
-
-/* ---- Field question panel ---- */
+/* ============================================================
+   FIELD QUESTION PANEL
+   ============================================================ */
 #field-question-panel {
-  background: #1a1a2e;
+  background: #14142e;
   border: 1px solid #6366f1;
   border-radius: 10px;
   margin: 8px 12px;
@@ -281,23 +523,18 @@ footer {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  flex-shrink: 0;
 }
-
 #field-question-text {
   color: #e0e7ff;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.4;
 }
-
-#field-input-row {
-  display: flex;
-  gap: 6px;
-}
-
+#field-input-row { display: flex; gap: 6px; }
 #field-answer-input {
   flex: 1;
-  background: #0f0f1a;
+  background: #0f0f1e;
   border: 1px solid #4338ca;
   border-radius: 6px;
   color: #e2e8f0;
@@ -305,11 +542,7 @@ footer {
   padding: 6px 10px;
   outline: none;
 }
-
-#field-answer-input:focus {
-  border-color: #818cf8;
-}
-
+#field-answer-input:focus { border-color: #818cf8; }
 #field-answer-send {
   background: #4f46e5;
   border: none;
@@ -320,46 +553,89 @@ footer {
   font-weight: 600;
   padding: 6px 12px;
 }
+#field-answer-send:hover { background: #6366f1; }
+#field-input-hint { color: #4a4a6a; font-size: 10px; }
 
-#field-answer-send:hover {
-  background: #6366f1;
+/* ============================================================
+   ACTION LOG
+   ============================================================ */
+#action-log-wrap {
+  flex-shrink: 0;
+  border-top: 1px solid #181830;
+  max-height: 160px;
+  display: flex;
+  flex-direction: column;
 }
-
-#field-input-hint {
-  color: #6b7280;
-  font-size: 10px;
+#action-log-header {
+  font-size: 9px;
+  font-weight: 700;
+  color: #2e2e50;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 12px 3px;
+  background: #0c0c1a;
+  flex-shrink: 0;
 }
+#action-log { overflow-y: auto; flex: 1; padding: 2px 0; }
+.log-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  font-size: 11px;
+  line-height: 1.4;
+  border-bottom: 1px solid #131328;
+  transition: background 0.1s;
+}
+.log-entry:hover { background: #111124; }
+.log-icon  { font-size: 12px; flex-shrink: 0; width: 16px; text-align: center; }
+.log-desc  { color: #555580; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-time  { color: #30304a; font-size: 10px; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.log-entry.verified  .log-desc { color: #4ade80; }
+.log-entry.failed    .log-desc { color: #f87171; }
+.log-entry.thinking  .log-desc { color: #818cf8; }
+.log-entry.navigating .log-desc { color: #60a5fa; }
 
-/* ---- Recording banner ---- */
+/* ============================================================
+   RECORDING BANNER
+   ============================================================ */
 #recording-banner {
   position: absolute;
-  bottom: 76px;
-  left: 0; right: 0;
-  background: #2a1a1a;
-  border-top: 1px solid #ef4444;
+  bottom: 10px;
+  left: 10px;
+  right: 10px;
+  background: #1e0f0f;
+  border: 1px solid #ef4444;
+  border-radius: 10px;
   color: #fca5a5;
   font-size: 11px;
   font-weight: 500;
-  padding: 6px 14px;
+  padding: 7px 14px;
   display: flex;
   align-items: center;
   gap: 8px;
+  z-index: 20;
 }
-
 .rec-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #ef4444;
   flex-shrink: 0;
-  animation: pulse 1s infinite;
+  animation: rec-blink 1s ease-in-out infinite;
+}
+@keyframes rec-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.25; }
 }
 
-/* ---- Settings drawer ---- */
+/* ============================================================
+   SETTINGS DRAWER
+   ============================================================ */
 #settings-drawer {
   position: absolute;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: #0f0f0f;
+  inset: 0;
+  background: #0c0c1a;
   overflow-y: auto;
   z-index: 100;
   padding: 0 14px 14px;
@@ -367,54 +643,40 @@ footer {
   flex-direction: column;
   gap: 16px;
 }
-
 .settings-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 12px 0 8px;
-  border-bottom: 1px solid #222;
+  border-bottom: 1px solid #1e1e36;
   flex-shrink: 0;
   margin-bottom: 4px;
 }
-
-.settings-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: #818cf8;
-}
-
+.settings-title { font-size: 13px; font-weight: 600; color: #818cf8; }
 #settings-close-btn {
   background: none;
-  border: 1px solid #2a2a2a;
+  border: 1px solid #252542;
   border-radius: 5px;
-  color: #aaa;
+  color: #666;
   font-size: 11px;
   padding: 3px 10px;
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s;
 }
 #settings-close-btn:hover { border-color: #818cf8; color: #818cf8; }
-
-.settings-section {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
+.settings-section { display: flex; flex-direction: column; gap: 6px; }
 .settings-section label {
   font-size: 11px;
   font-weight: 600;
-  color: #666;
+  color: #444;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
-
 .settings-section input[type="password"],
 .settings-section input[type="text"],
 .settings-section select {
-  background: #1a1a1a;
-  border: 1px solid #2a2a2a;
+  background: #131326;
+  border: 1px solid #252542;
   border-radius: 6px;
   padding: 7px 10px;
   color: #e8e8e8;
@@ -424,37 +686,21 @@ footer {
 }
 .settings-section input:focus,
 .settings-section select:focus { border-color: #818cf8; }
-
-.hint {
-  font-size: 10px;
-  color: #444;
-}
-
-#skills-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 6px;
-}
-
+.hint { font-size: 10px; color: #333355; }
+#skills-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; }
 .skill-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 5px 8px;
-  background: #161616;
-  border: 1px solid #252525;
+  background: #141428;
+  border: 1px solid #22223a;
   border-radius: 6px;
   font-size: 11px;
 }
-
 .skill-item-name { color: #818cf8; font-weight: 600; }
-.skill-item-type { color: #444; font-size: 10px; }
-
-.skill-install-row {
-  display: flex;
-  gap: 6px;
-}
+.skill-item-type { color: #333355; font-size: 10px; }
+.skill-install-row { display: flex; gap: 6px; }
 .skill-install-row input { flex: 1; }
 .skill-install-row button {
   background: #1e1a40;
@@ -467,78 +713,52 @@ footer {
   cursor: pointer;
 }
 .skill-install-row button:hover { background: #818cf8; color: #fff; }
-
-#workflows-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
+#workflows-list { display: flex; flex-direction: column; gap: 4px; }
 .workflow-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 5px 8px;
-  background: #161616;
-  border: 1px solid #252525;
+  background: #141428;
+  border: 1px solid #22223a;
   border-radius: 6px;
   font-size: 11px;
 }
-.workflow-item-name { color: #d4d4d8; }
-.workflow-item-date { color: #444; font-size: 10px; }
-
-/* ---- Profile memory list ---- */
-#profile-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 4px;
-}
-
+.workflow-item-name { color: #d4d4e8; }
+.workflow-item-date { color: #333355; font-size: 10px; }
+#profile-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
 .profile-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 5px 8px;
-  background: #161616;
-  border: 1px solid #252525;
+  background: #141428;
+  border: 1px solid #22223a;
   border-radius: 6px;
   font-size: 11px;
   gap: 8px;
 }
-
-.profile-item-key {
-  color: #818cf8;
-  font-weight: 600;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.profile-item-value {
-  color: #a1a1aa;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-
-.profile-item-del {
-  background: none;
-  border: none;
-  color: #52525b;
-  cursor: pointer;
-  font-size: 13px;
-  line-height: 1;
-  padding: 0 2px;
-  flex-shrink: 0;
-}
-
+.profile-item-key   { color: #818cf8; font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+.profile-item-value { color: #7a7a9a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.profile-item-del   { background: none; border: none; color: #333355; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0; }
 .profile-item-del:hover { color: #f87171; }
 
-/* ---- Utilities ---- */
+/* ============================================================
+   UTILITIES
+   ============================================================ */
 .hidden { display: none !important; }
 
-::-webkit-scrollbar { width: 4px; }
+/* Subtle pulse for status states (kept for any future use) */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+::-webkit-scrollbar-thumb { background: #1e1e38; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #2e2e52; }
+
+/* Badge classes — kept so JS doesn't throw, but hidden */
+.badge { display: none; }
