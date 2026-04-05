@@ -360,6 +360,11 @@
     setupRobotDrag();
     applyState('idle');
     rafId = requestAnimationFrame(raf);
+
+    // Sync state from storage in case a task is already running on another page
+    chrome.storage.session.get('ctrl_robot_display', (res) => {
+      syncFromStorage(res?.ctrl_robot_display);
+    });
   }
 
   // ── RAF LOOP ───────────────────────────────────────────────────────────
@@ -1139,6 +1144,33 @@
         break;
     }
   }
+
+  // ── CROSS-PAGE STATE SYNC ──────────────────────────────────────────────
+  // Read shared state written by background so every new page shows the correct
+  // robot state even if it never received the original ROBOT_STATE message.
+  function syncFromStorage(display) {
+    if (!display) return;
+    if (isSadCorner || isMuted) return;
+    const s = display.state;
+    if (display.isRunning && s && s !== 'idle' && s !== state) {
+      applyState(s);
+      // Show a gentle "still working" indicator so the user isn't confused
+      if (s === 'thinking' || s === 'acting') {
+        enqueue('Working on it…', 'thought', null);
+        const stopEl = shadow?.getElementById('ctrl-stop');
+        if (stopEl) stopEl.style.display = 'block';
+      }
+    } else if (!display.isRunning && state !== 'idle') {
+      applyState('idle');
+      const stopEl = shadow?.getElementById('ctrl-stop');
+      if (stopEl) stopEl.style.display = 'none';
+    }
+  }
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'session' || !changes.ctrl_robot_display) return;
+    syncFromStorage(changes.ctrl_robot_display.newValue);
+  });
 
   // ── INIT ───────────────────────────────────────────────────────────────
   if (document.readyState === 'loading') {
