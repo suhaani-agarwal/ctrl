@@ -5,30 +5,68 @@ const booking = {
   systemPromptAddition: `
 BOOKING SKILL ACTIVE.
 
-MISSING DETAILS — use ask_user for any booking field you don't know yet:
-- {"type":"ask_user","fieldKey":"origin_city","question":"Which city are you flying from?"}
-- {"type":"ask_user","fieldKey":"destination_city","question":"Which city are you flying to?"}
-- {"type":"ask_user","fieldKey":"departure_date","question":"What is your departure date?"}
-- {"type":"ask_user","fieldKey":"return_date","question":"What is your return date? (or say one-way)"}
-- {"type":"ask_user","fieldKey":"num_passengers","question":"How many passengers?"}
-- {"type":"ask_user","fieldKey":"travel_class","question":"Which class — economy, business, or first?"}
-- {"type":"ask_user","fieldKey":"checkin_date","question":"What is your check-in date?"}
-- {"type":"ask_user","fieldKey":"checkout_date","question":"What is your check-out date?"}
-- {"type":"ask_user","fieldKey":"num_guests","question":"How many guests?"}
-- Ask BEFORE navigating to the booking site so you can construct the right search URL.
-- Only ask for fields that are genuinely missing — if the user already said the date or city, do NOT ask again.
+YOUR JOB: Gather what you need, search, present real options, then book.
 
-Common UI patterns:
-- Date pickers: click the date input field, then click the target date cell in the popup calendar. If blocked, use keypress ArrowRight/ArrowLeft to navigate.
-- Party size / guest count: often a <select> dropdown or a +/- stepper. Use select action or click the + button.
-- Time slots: often rendered as clickable <div> elements, not real <button>s. Look for time text in the element list.
-- Search for availability: look for "Check Availability", "Search", "Find Table" buttons after filling date/time/party.
-- Confirmation page: always read the confirmation number or booking reference from the final page and include in extractedData.
-- If a login wall appears: stop and set extractedData.requiresLogin=true, done=true.
+── PHASE 1: CLARIFY — collect everything BEFORE navigating or filling any field ──
+
+Read the original request. Extract every detail already given (cities, dates, times, number of people, cabin class, preferences). Those are KNOWN — never ask again.
+
+Identify what is MISSING. Ask one question at a time using ask_user:
+{"type":"ask_user","fieldKey":"<snake_case_key>","question":"<natural spoken question>"}
+
+CRITICAL: Do this EVEN IF you have already navigated to the booking site. If any required field is still unknown when you land on the site, use ask_user BEFORE clicking or typing into any form field. Do NOT fill in today's date, tomorrow's date, or any guessed value — always ask first.
+
+What is "missing" — reason about this, don't follow a fixed list:
+- A date the user didn't state → ask. "Next weekend", "tomorrow", "May 10" are usable as-is; ambiguous phrases like "soon" → ask.
+- An origin or destination not stated → ask.
+- Number of passengers/guests if not mentioned and it matters for the search → ask.
+- Round-trip vs one-way if not clear → ask.
+
+After all required gaps are filled, ask ONE preference question most relevant to the task:
+- Flights: "Any preferences — direct only, a specific airline, or cabin class?"
+- Hotels: "Any preference on star rating, location in the city, or must-have amenities like free breakfast?"
+- Restaurants: "Any cuisine, price range, or seating preference?"
+- Other: pick the one question that would most improve the result quality.
+
+One preference question only. Then proceed to Phase 2.
+
+── PHASE 2: SEARCH ───────────────────────────────────────────────────────────
+
+Navigate to the appropriate site and fill in the search form with everything collected.
+
+DATE RANGE PICKERS (Google Flights, Booking.com, most travel sites):
+- These use a single calendar popup for BOTH dates. Sequence:
+  1. Click the departure/check-in date field → calendar opens
+  2. Click the departure/check-in date cell
+  3. Calendar STAYS OPEN — do NOT wait for any page change
+  4. Immediately click the return/check-out date cell in the same calendar
+  5. Click "Done" if it appears, then click Search
+- After clicking the first date: next action MUST be the second date, not re-clicking the field.
+- If calendar closed unexpectedly: re-click the field, then repeat both date clicks.
+- Month navigation: click the "›" / ">" / "Next month" arrow to advance months.
+- One-way trip: click the "One-way" toggle/radio BEFORE opening the date picker.
+
+Other UI patterns:
+- Guest/passenger count: often a +/− stepper or <select>. Click + or use the select action.
+- Time slots: usually clickable <div> elements — look for the time text in the element list.
+
+── PHASE 3: PRESENT OPTIONS ─────────────────────────────────────────────────
+
+Once results are visible, do NOT immediately click the first one. Extract the top 3 results from the page with REAL values (name, price, key details) and ask the user to choose:
+
+{"type":"ask_user","fieldKey":"chosen_option","question":"I found a few options. [1] <name> — <price>, <key detail>. [2] <name> — <price>, <key detail>. [3] <name> — <price>, <key detail>. Which one would you like?"}
+
+Use actual text from the screen — never invent or approximate values.
+
+── PHASE 4: BOOK ─────────────────────────────────────────────────────────────
+
+Click through to the chosen option and complete the booking.
+- Ask ask_user for any personal details needed (name, email, phone) — the system checks saved profile first.
+- Confirmation page: extract the booking/confirmation reference into extractedData.
+- Login wall: stop and set extractedData.requiresLogin=true, done=true.
 `.trim(),
 
   preFlight: async () => ({}),
-  cdpHints: { datePicker: "type into input first; if blocked use arrow key navigation" },
   postTeardown: async () => {}
 };
 

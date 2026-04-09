@@ -215,12 +215,17 @@
 
   <div id="ctrl-mute" title="Silence &amp; freeze robot">🔇</div>
   <div id="ctrl-stop" title="Stop current task" style="display:none">⏹</div>
+  <div id="ctrl-bg-btn" title="Send to background">⬇ bg</div>
+  <div id="ctrl-bg-indicator" style="display:none">⚙ working in background</div>
 </div>`;
 
   // ── SHADOW DOM REFS ────────────────────────────────────────────────────
   let host, shadow, root, robotEl, flipEl, svgEl, headGrp;
-  let bubbleEl, bubbleIcon, bubbleText, micEl, micLbl;
+  let bubbleEl, bubbleIcon, bubbleText, micEl, micLbl, bgBtnEl, bgIndicatorEl;
   let legL, legR, armL, armR;
+
+  // ── BACKGROUND TASK STATE ──────────────────────────────────────────────
+  let activeBgTaskId = null;  // taskId this tab is answering questions for (origin tab)
   let accBulb, accSweat, accQ, accStars, accSpeed, accRocket, accRope, accTears;
   let sparkL, sparkR, xeyeL, xeyeR, antEl;
 
@@ -291,6 +296,9 @@
   // ── MUTE / FREEZE STATE ───────────────────────────────────────────────
   let isMuted = false;
 
+  // ── AWAITING USER ANSWER STATE ─────────────────────────────────────────
+  let awaitingAnswer = false;
+
   // ── MIC STATE ─────────────────────────────────────────────────────────
   let micActive = false, pillFixed = false;
   let pillX = 0, pillY = 0;
@@ -332,9 +340,11 @@
     bubbleEl  = shadow.getElementById('ctrl-bubble');
     bubbleIcon= shadow.getElementById('ctrl-bubble-icon');
     bubbleText= shadow.getElementById('ctrl-bubble-text');
-    micEl     = shadow.getElementById('ctrl-mic');
-    micLbl    = shadow.getElementById('ctrl-mic-lbl');
-    legL      = shadow.getElementById('leg-l');
+    micEl         = shadow.getElementById('ctrl-mic');
+    micLbl        = shadow.getElementById('ctrl-mic-lbl');
+    bgBtnEl       = shadow.getElementById('ctrl-bg-btn');
+    bgIndicatorEl = shadow.getElementById('ctrl-bg-indicator');
+    legL          = shadow.getElementById('leg-l');
     legR      = shadow.getElementById('leg-r');
     armL      = shadow.getElementById('arm-l');
     armR      = shadow.getElementById('arm-r');
@@ -361,9 +371,17 @@
     applyState('idle');
     rafId = requestAnimationFrame(raf);
 
+    // "Do in background" button
+    bgBtnEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      chrome.runtime.sendMessage({ type: 'SEND_TO_BACKGROUND' }).catch(() => {});
+      enqueue('Running in background!', 'shout', 2000);
+    });
+
     // Sync state from storage in case a task is already running on another page
-    chrome.storage.session.get('ctrl_robot_display', (res) => {
+    chrome.storage.session.get(['ctrl_robot_display', 'ctrl_bg_tasks'], (res) => {
       syncFromStorage(res?.ctrl_robot_display);
+      syncBgTasksFromStorage(res?.ctrl_bg_tasks);
     });
   }
 
@@ -672,6 +690,12 @@
     setTimeout(() => { doingInteraction = false; }, 1200);
   }
 
+  function updateMicLabel() {
+    micLbl.textContent = micActive
+      ? (awaitingAnswer ? 'speak now' : 'listening')
+      : (awaitingAnswer ? 'tap to answer' : 'speak');
+  }
+
   // ── STATE MACHINE ──────────────────────────────────────────────────────
   function applyState(newState) {
     if (state === newState) return;
@@ -946,6 +970,7 @@
       }
       micActive = true;
       micEl.dataset.active = 'true';
+      micEl.classList.remove('awaiting-answer');
       micLbl.textContent = 'connecting…';
       applyState('listening');
 
@@ -953,10 +978,12 @@
         await chrome.runtime.sendMessage({ type: 'DISCONNECT_WEBSOCKET' });
         await chrome.runtime.sendMessage({ type: 'CONNECT_WEBSOCKET', apiKey: gemini_key });
         await chrome.runtime.sendMessage({ type: 'START_MIC' });
+        updateMicLabel();
       } catch (e) {
         micActive = false;
         micEl.dataset.active = 'false';
-        micLbl.textContent = 'speak';
+        micEl.classList.toggle('awaiting-answer', awaitingAnswer);
+        updateMicLabel();
         enqueue('Failed to start mic 😞', 'speech', 2500);
         applyState('idle');
       }
@@ -1098,7 +1125,8 @@
       case 'MIC_READY':
         micActive = true;
         micEl.dataset.active = 'true';
-        micLbl.textContent = 'listening';
+        micEl.classList.remove('awaiting-answer');
+        updateMicLabel();
         applyState('listening');
         break;
 
@@ -1116,6 +1144,43 @@
         handleAgentEventOnRobot(ev);
         break;
       }
+
+      // Background task messages from background.js
+      case 'ROBOT_BG_QUESTION': {
+        activeBgTaskId = msg.taskId;
+        awaitingAnswer = true;
+        enqueue(`❓ ${(msg.question || '').slice(0, 80)}`, 'speech', 12000);
+        applyState('listening');
+        if (!micActive) {
+          micEl.classList.add('awaiting-answer');
+          updateMicLabel();
+        }
+        break;
+      }
+
+      case 'ROBOT_BG_COMPLETE': {
+        activeBgTaskId = null;
+        const doneText = msg.status === 'done'
+          ? `✓ Done: ${(msg.intentText || '').slice(0, 60)}`
+          : `✗ Failed: ${(msg.intentText || '').slice(0, 60)}`;
+        enqueue(doneText, 'shout', 3000);
+        applyState('idle');
+        if (bgIndicatorEl) bgIndicatorEl.style.display = 'none';
+        if (bgBtnEl) bgBtnEl.style.display = '';
+        break;
+      }
+
+      case 'ROBOT_BG_IDLE':
+        applyState('idle');
+        if (bgIndicatorEl) bgIndicatorEl.style.display = 'none';
+        if (bgBtnEl) bgBtnEl.style.display = '';
+        break;
+
+      case 'ROBOT_BG_STARTED':
+        if (bgIndicatorEl) bgIndicatorEl.style.display = '';
+        if (bgBtnEl) bgBtnEl.style.display = 'none';
+        enqueue('Working in background…', 'thought', 2000);
+        break;
     }
   });
 
@@ -1136,14 +1201,33 @@
       case 'STEP_DONE':
         enqueue(`Step ${ev.step} done! ✓`, 'shout', 1600);
         break;
-      case 'FIELD_QUESTION':
-        if (ev.question) enqueue(`❓ ${ev.question.slice(0, 70)}`, 'speech', 5000);
+      case 'FIELD_QUESTION': {
+        if (!ev.question) break;
+        awaitingAnswer = true;
+        enqueue(`❓ ${ev.question.slice(0, 80)}`, 'speech', 10000);
+        applyState('listening');
+        if (!micActive) {
+          micEl.classList.add('awaiting-answer');
+          updateMicLabel();
+        }
         break;
+      }
+      case 'FIELD_ANSWERED': {
+        awaitingAnswer = false;
+        micEl.classList.remove('awaiting-answer');
+        updateMicLabel();
+        if (ev.answer && !ev.timedOut) enqueue('Got it! ✓', 'shout', 1500);
+        break;
+      }
       case 'TASK_DISPATCHED':
         if (ev.intentText) enqueue(ev.intentText.slice(0, 80), 'shout', 2800);
         break;
+      case 'PLAN_ANNOUNCED':
+      case 'AGENT_START':
+        break;
     }
   }
+
 
   // ── CROSS-PAGE STATE SYNC ──────────────────────────────────────────────
   // Read shared state written by background so every new page shows the correct
@@ -1167,9 +1251,40 @@
     }
   }
 
+  // Check if this tab is owned by a background task, and show/hide indicator accordingly
+  function syncBgTasksFromStorage(bgTasksList) {
+    chrome.tabs.getCurrent((tab) => {
+      if (!tab) return;
+      const activeTasks = (bgTasksList || []).filter(t => t.status === 'running' || t.status === 'awaiting_input');
+      const myTask = activeTasks.find(t => (t.ownedTabIds || []).includes(tab.id));
+      const isOriginTab = activeTasks.find(t => t.originTabId === tab.id);
+
+      if (myTask) {
+        // This tab is a bg task's worker tab — show indicator, hide mic
+        if (bgIndicatorEl) bgIndicatorEl.style.display = '';
+        if (bgBtnEl) bgBtnEl.style.display = 'none';
+        if (micEl) micEl.style.display = 'none';
+      } else {
+        // Not a bg worker tab — ensure indicator hidden, mic/bgBtn visible
+        if (bgIndicatorEl) bgIndicatorEl.style.display = 'none';
+        if (micEl) micEl.style.display = '';
+        if (bgBtnEl) bgBtnEl.style.display = '';
+      }
+
+      // If this is the origin tab and there's a pending question, show it on the robot
+      if (isOriginTab?.hasPendingQuestion && isOriginTab.question) {
+        activeBgTaskId = isOriginTab.taskId;
+        awaitingAnswer = true;
+        enqueue(`❓ ${isOriginTab.question.slice(0, 80)}`, 'speech', 12000);
+        applyState('listening');
+      }
+    });
+  }
+
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'session' || !changes.ctrl_robot_display) return;
-    syncFromStorage(changes.ctrl_robot_display.newValue);
+    if (area !== 'session') return;
+    if (changes.ctrl_robot_display) syncFromStorage(changes.ctrl_robot_display.newValue);
+    if (changes.ctrl_bg_tasks) syncBgTasksFromStorage(changes.ctrl_bg_tasks.newValue);
   });
 
   // ── INIT ───────────────────────────────────────────────────────────────

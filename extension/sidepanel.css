@@ -762,3 +762,85 @@ body {
 
 /* Badge classes — kept so JS doesn't throw, but hidden */
 .badge { display: none; }
+
+
+/* ---- Background Tasks Panel ---- */
+#bg-tasks-wrap {
+  margin: 8px 0;
+  border: 1px solid #a78bfa44;
+  border-radius: 8px;
+  overflow: hidden;
+}
+#bg-tasks-header {
+  background: #1a0f2e;
+  color: #a78bfa;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  letter-spacing: 0.04em;
+}
+.bg-task-item {
+  padding: 7px 10px;
+  border-top: 1px solid #1e1e38;
+  background: #0f0f1e;
+}
+.bg-task-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bg-task-text {
+  color: #c4b5fd;
+  font-size: 11px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bg-task-status {
+  font-size: 10px;
+  color: #818cf8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.bg-task-cancel {
+  background: none;
+  border: none;
+  color: #333355;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.bg-task-cancel:hover { color: #f87171; }
+.bg-task-question {
+  margin-top: 5px;
+  font-size: 11px;
+  color: #f9a8d4;
+}
+.bg-task-answer-row {
+  display: flex;
+  gap: 5px;
+  margin-top: 4px;
+}
+.bg-task-answer-input {
+  flex: 1;
+  background: #141428;
+  border: 1px solid #2e2e52;
+  border-radius: 6px;
+  color: #e0e0f0;
+  font-size: 11px;
+  padding: 4px 8px;
+  outline: none;
+}
+.bg-task-answer-input:focus { border-color: #a78bfa; }
+.bg-task-answer-send {
+  background: #a78bfa22;
+  border: 1px solid #a78bfa55;
+  border-radius: 6px;
+  color: #a78bfa;
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.bg-task-answer-send:hover { background: #a78bfa44; }

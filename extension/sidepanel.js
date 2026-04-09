@@ -26,6 +26,8 @@ const taskText = document.getElementById("task-text");
 const skillBadge = document.getElementById("skill-badge");
 const stepCounter = document.getElementById("step-counter");
 const tabBadges = document.getElementById("tab-badges");
+const bgTasksWrap = document.getElementById("bg-tasks-wrap");
+const bgTasksList = document.getElementById("bg-tasks-list");
 const transcript = document.getElementById("transcript");
 const actionLog = document.getElementById("action-log");
 const settingsBtn = document.getElementById("settings-btn");
@@ -62,6 +64,7 @@ chrome.storage.local.get(["gemini_key", "groq_key", "openrouter_key", "permissio
 
   loadSkillsList();
   loadWorkflowsList();
+  loadBgTasks();
 });
 
 // ---- Settings ----
@@ -284,6 +287,11 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   // Workflow recording markers from Gemini Live
+  if (message.type === "BG_TASKS_UPDATED") {
+    loadBgTasks();
+    return;
+  }
+
   if (message.type === "RECORD_START") {
     isRecording = true;
     recordingSteps = [];
@@ -300,6 +308,12 @@ chrome.runtime.onMessage.addListener((message) => {
   // Agent events from background
   if (message.type === "AGENT_EVENT") {
     handleAgentEvent(message.event);
+    // Refresh bg tasks panel on task lifecycle events
+    const ev = message.event;
+    if (ev && (ev.type === "TASK_COMPLETE" || ev.type === "TASK_FAILED" || ev.type === "TASK_ABORTED" ||
+               ev.type === "FIELD_QUESTION" || ev.type === "FIELD_ANSWERED" || ev.type === "TASK_DISPATCHED")) {
+      loadBgTasks();
+    }
     return;
   }
 });
@@ -655,6 +669,65 @@ async function loadWorkflowsList() {
       <span class="workflow-item-date">${new Date(w.createdAt).toLocaleDateString()}</span>
     </div>`
   ).join("") || "<span class='hint'>No saved workflows</span>";
+}
+
+// ---- Background Tasks UI ----
+async function loadBgTasks() {
+  const res = await msgBg({ type: "GET_BG_TASKS" });
+  const tasks = res?.tasks || [];
+  renderBgTasks(tasks);
+}
+
+function renderBgTasks(tasks) {
+  const active = tasks.filter(t => t.status === 'running' || t.status === 'awaiting_input' || t.status === 'pending');
+  if (!bgTasksWrap || !bgTasksList) return;
+  if (active.length === 0) {
+    bgTasksWrap.classList.add("hidden");
+    return;
+  }
+  bgTasksWrap.classList.remove("hidden");
+  bgTasksList.innerHTML = "";
+  for (const task of active) {
+    const item = document.createElement("div");
+    item.className = "bg-task-item";
+
+    const statusLabel = { running: "⚙ running", awaiting_input: "❓ needs input", pending: "⏳ pending" }[task.status] || task.status;
+    item.innerHTML = `
+      <div class="bg-task-top">
+        <span class="bg-task-text" title="${task.intentText}">${task.intentText.slice(0, 55)}</span>
+        <span class="bg-task-status">${statusLabel}</span>
+        <button class="bg-task-cancel" data-id="${task.taskId}">✕</button>
+      </div>
+      ${task.hasPendingQuestion ? `
+        <div class="bg-task-question">❓ ${task.question}</div>
+        <div class="bg-task-answer-row">
+          <input type="text" class="bg-task-answer-input" placeholder="Type your answer…" data-id="${task.taskId}" data-key="${task.fieldKey}"/>
+          <button class="bg-task-answer-send" data-id="${task.taskId}">Send</button>
+        </div>
+      ` : ""}
+    `;
+
+    item.querySelector(".bg-task-cancel").onclick = () => {
+      msgBg({ type: "ABORT_BG_TASK", taskId: task.taskId });
+      loadBgTasks();
+    };
+
+    if (task.hasPendingQuestion) {
+      const input = item.querySelector(".bg-task-answer-input");
+      const sendBtn = item.querySelector(".bg-task-answer-send");
+      const submitAnswer = () => {
+        const text = input.value.trim();
+        if (!text) return;
+        msgBg({ type: "BG_FIELD_ANSWER", taskId: task.taskId, text });
+        appendLog("💬", `BG task answer: ${text.slice(0, 60)}`, "");
+        loadBgTasks();
+      };
+      sendBtn.onclick = submitAnswer;
+      input.addEventListener("keydown", e => { if (e.key === "Enter") submitAnswer(); });
+    }
+
+    bgTasksList.appendChild(item);
+  }
 }
 
 // ---- Utility ----

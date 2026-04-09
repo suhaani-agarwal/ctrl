@@ -28,6 +28,14 @@ let pendingTaskCooldownUntil = 0; // ignore mic input for N ms after asking a qu
 let currentAgentTabId = null; // tab where the robot overlay is active
 let robotMicTabId = null;     // set when mic is started from the robot content script (not sidepanel)
 
+// ---- Background Task Registry ----
+const bgTasks = new Map();    // taskId → BackgroundTask
+const tabToTask = new Map();  // tabId  → taskId
+const MAX_BG_TASKS = 5;
+let pendingBackgroundFlag = false; // set by SEND_TO_BACKGROUND; checked at top of executePlan
+let foregroundTask = null; // { decision, intentText, currentTab } — live while a foreground task is executing
+let fgTaskGeneration = 0; // incremented each time a new foreground task starts; guards finally blocks
+
 // CDP: tabId → { attached: boolean }
 const cdpSessions = new Map();
 // Per-round element map: tabId → Map<index, { backendNodeId, x, y, w, h, role, name }>
@@ -57,6 +65,34 @@ async function onStartup() {
 }
 onStartup();
 
+// On service worker restart: any "running" bg tasks are orphaned — mark aborted
+chrome.storage.session.get('ctrl_bg_tasks', (res) => {
+  const saved = res?.ctrl_bg_tasks || [];
+  for (const t of saved) {
+    if (t.status === 'running' || t.status === 'awaiting_input') {
+      chrome.notifications.create(`ctrl-bg-done-${t.taskId}`, {
+        type: 'basic', iconUrl: 'icons/icon128.png',
+        title: 'ctrl — Task Interrupted',
+        message: `"${t.intentText.slice(0, 80)}" was interrupted (extension restarted).`,
+        requireInteraction: false
+      }).catch(() => {});
+    }
+  }
+  chrome.storage.session.remove('ctrl_bg_tasks').catch(() => {});
+});
+
+// When user clicks "Answer" on a field-question notification, focus the origin tab
+chrome.notifications.onButtonClicked.addListener((notifId) => {
+  const match = notifId.match(/^ctrl-fq-([^-]+)-(.+)$/);
+  if (!match) return;
+  const taskId = match[1];
+  const bgTask = bgTasks.get(taskId);
+  if (bgTask?.originTabId) {
+    chrome.tabs.update(bgTask.originTabId, { active: true }).catch(() => {});
+    chrome.windows.update(-1, { focused: true }).catch(() => {});
+  }
+});
+
 // ---- Event broadcast ----
 // Sends { type: "AGENT_EVENT", event: { type, ...fields } } to the side panel.
 function broadcastEvent(event) {
@@ -75,7 +111,9 @@ function sendToRobot(tabId, msg) {
 
 function forwardToRobot(event) {
   const tid = event.tabId || currentAgentTabId;
-  if (event.tabId) currentAgentTabId = event.tabId;
+  // Only update currentAgentTabId for foreground tabs.
+  // Background task tabs are registered in tabToTask — never let them overwrite the foreground pointer.
+  if (event.tabId && !tabToTask.has(event.tabId)) currentAgentTabId = event.tabId;
 
   switch (event.type) {
     case "ORCHESTRATOR_START":
@@ -84,9 +122,11 @@ function forwardToRobot(event) {
       break;
     case "PLAN_ANNOUNCED":
       sendToRobot(tid, { type: "ROBOT_BULB", text: event.planText || "Got a plan!" });
+      sendToRobot(tid, { type: "AGENT_EVENT", event }); // triggers bg button in robot.js
       break;
     case "AGENT_START":
-      currentAgentTabId = event.tabId;
+      // Only update for foreground tabs
+      if (event.tabId && !tabToTask.has(event.tabId)) currentAgentTabId = event.tabId;
       sendToRobot(event.tabId, { type: "ROBOT_STATE", state: "acting" });
       sendToRobot(event.tabId, { type: "ROBOT_MSG", text: event.goal ? event.goal.slice(0, 80) : "On it!", msgType: "shout" });
       break;
@@ -419,6 +459,30 @@ function handleGeminiLiveMessage(rawText) {
       }
     }
 
+    // If a background task is awaiting input from the current robot-mic tab, route there
+    if (!pendingFieldQuestion && userTranscript) {
+      const cooldownPassed = Date.now() > pendingTaskCooldownUntil;
+      if (cooldownPassed) {
+        for (const bgTask of bgTasks.values()) {
+          if (bgTask.pendingFieldQuestion && bgTask.originTabId === robotMicTabId) {
+            const cleanAnswer = userTranscript.trim();
+            if (cleanAnswer.length > 0) {
+              console.log("BG: Routing speech to bg task field question:", bgTask.taskId, bgTask.pendingFieldQuestion.fieldKey);
+              const { fieldKey, resolve } = bgTask.pendingFieldQuestion;
+              bgTask.pendingFieldQuestion = null;
+              bgTask.status = 'running';
+              chrome.action.setBadgeText({ text: '' }).catch(() => {});
+              persistBgTasks();
+              broadcastEvent({ type: 'FIELD_ANSWERED', fieldKey, answer: cleanAnswer });
+              resolve(cleanAnswer);
+              return;
+            }
+            break;
+          }
+        }
+      }
+    }
+
     // If waiting for user reply to a plan/clarification, route there first
     // BUT skip if still in cooldown period (Gemini's own audio being picked up by mic)
     if (pendingTask && userTranscript) {
@@ -566,6 +630,20 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   cdpSessions.delete(tabId);
   elementMaps.delete(tabId);
+
+  // Clean up background task ownership
+  const taskId = tabToTask.get(tabId);
+  tabToTask.delete(tabId);
+  if (taskId) {
+    const bgTask = bgTasks.get(taskId);
+    if (bgTask) {
+      bgTask.ownedTabIds = bgTask.ownedTabIds.filter(t => t !== tabId);
+      if (bgTask.ownedTabIds.length === 0 && (bgTask.status === 'running' || bgTask.status === 'awaiting_input')) {
+        bgTask.abortController.abort();
+        finalizeBgTask(taskId, 'aborted', 'All task tabs were closed');
+      }
+    }
+  }
 });
 
 async function ensureAttached(tabId) {
@@ -1292,16 +1370,16 @@ planSummary rules:
 AI TOOL ROUTING — for these tasks, ALWAYS prefer the specialized skill listed:
 - "presentation", "slides", "deck", "ppt", "pitch deck", "slideshow" → skill: ppt-gamma
 - "research", "deep search", "look up", "find information about", "learn about" → skill: research-perplexity
-- "compare prices", "cheapest", "best price", "best deal", "how much does X cost", "find a cheaper" → skill: price-compare, taskType: multi-tab-parallel. For parallelSubtasks: if the user explicitly names specific sites (e.g. "Amazon or Flipkart", "on Amazon and Myntra"), use ONLY those sites. Otherwise default to Amazon India (amazon.in), Flipkart, and the most relevant third site for the category (electronics→croma.com, furniture/home→ikea.com/in, fashion→myntra.com). Each subGoal must say "find the CHEAPEST matching product and extract its price and title from search results".
+- "compare prices", "price compare", "best price", "best deal", "how much does X cost", "find a cheaper", "compare X vs Y price" → skill: price-compare, taskType: multi-tab-parallel. ONLY use this for physical products (electronics, clothing, appliances, etc.) that can be found on shopping sites. NEVER use price-compare for hotels, flights, trains, buses, cabs, food delivery, or any travel/accommodation/service. For parallelSubtasks: if the user explicitly names specific sites (e.g. "Amazon or Flipkart", "on Amazon and Myntra"), use ONLY those sites. Otherwise default to Amazon India (amazon.in), Flipkart, and the most relevant third site for the category (electronics→croma.com, furniture/home→ikea.com/in, fashion→myntra.com). Each subGoal must say "find the CHEAPEST matching product and extract its price and title from search results".
 - "buy", "shop", "find on amazon", "search on flipkart", "find on ikea", "find similar", "find something like this", "add to cart", "order this", "find this product" → skill: shopping
 - "summarize video", "summarize this youtube", "what is this video about", "video summary" → skill: youtube-summarize
 - "design", "UI mockup", "landing page design", "app design", "interface" → skill: design-stitch
 - "fill this form", "apply", "sign up", "register", "checkout form" → skill: form-fill
 
 SITE ROUTING — when no skill matches but the task clearly requires a specific site, set startUrl and taskType: "multi-step":
-- "book flight", "flight ticket", "fly to", "search flights", "cheap flights", "flight from" → startUrl: "https://www.google.com/flights"
+- "book flight", "flight ticket", "fly to", "search flights", "cheap flights", "cheapest flight", "budget flight", "flight from", "flights to" → startUrl: "https://www.google.com/flights"
 - "book train", "train ticket", "irctc", "rail ticket" → startUrl: "https://www.irctc.co.in"
-- "book hotel", "hotel booking", "find hotel", "stay in", "accommodation" → startUrl: "https://www.booking.com"
+- "book hotel", "hotel booking", "find hotel", "stay in", "accommodation", "cheap hotel", "budget hotel", "hotel in", "hotels in", "cheapest hotel" → startUrl: "https://www.booking.com"
 - "book bus", "bus ticket" → startUrl: "https://www.redbus.in"
 - "food delivery", "order food", "zomato", "swiggy" → startUrl: "https://www.zomato.com"
 - "cab", "uber", "ola", "taxi" → startUrl: "https://www.olacabs.com"
@@ -1403,7 +1481,7 @@ RULES:
 5. If a click has no effect, try a different element or approach — do NOT keep clicking the same thing
 6. Return ONLY the JSON object — no markdown, no extra text`;
 
-async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null, referenceB64 = null) {
+async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgentIndex = null, signal = null, referenceB64 = null, { fieldInputFn = null, silent = false } = {}) {
   console.log("BG: VisionActionAgent start — tab:", tabId, "goal:", goal, "skill:", skillName);
   const skill = skillName ? getSkill(skillName) : null;
   const systemPrompt = VISION_SYSTEM_PROMPT + (skill?.systemPromptAddition ? "\n\n" + skill.systemPromptAddition : "");
@@ -1583,7 +1661,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
     broadcastEvent({ type: "THOUGHT", tabId, thought: lastThought });
 
     // Every 4 rounds, send a voice update so the user knows we're still working
-    if (round % 4 === 0 && !done) {
+    if (!silent && round % 4 === 0 && !done) {
       const shortThought = lastThought?.split(".")[0] || "Still working on it";
       sendToGeminiLive(`[STATUS: ${shortThought}]`);
     }
@@ -1601,7 +1679,7 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
       if (noActionRounds >= 2) {
         console.error("BG: Agent stuck — 2 rounds with no actions, aborting");
         broadcastEvent({ type: "TASK_FAILED", error: "Agent stuck: no actions produced" });
-        sendToGeminiLive("[TASK_FAILED: Agent could not determine next action]");
+        if (!silent) sendToGeminiLive("[TASK_FAILED: Agent could not determine next action]");
         break;
       }
       lastThought = "You must output at least one action. If the page needs navigation, navigate now.";
@@ -1628,9 +1706,9 @@ async function runVisionActionAgent(tabId, goal, skillName, taskContext, subAgen
           broadcastEvent({ type: "THOUGHT", tabId, thought: `Found "${fieldKey}" in saved profile: "${answer.slice(0, 60)}"` });
           completedActions.push(`Auto-filled [${fieldKey}] from profile: "${answer.slice(0, 60)}"`);
         } else {
-          // 2. Ask user via voice + sidepanel text input
+          // 2. Ask user via voice + sidepanel text input (or bg notification if running silently)
           broadcastEvent({ type: "THOUGHT", tabId, thought: `No profile match for "${fieldKey}" — asking user` });
-          answer = await waitForUserFieldInput(question, fieldKey, isSubjective);
+          answer = await (fieldInputFn || waitForUserFieldInput)(question, fieldKey, isSubjective);
 
           if (!answer) {
             broadcastEvent({ type: "ACTION_FAILED", tabId, action, error: `No answer received for "${fieldKey}"` });
@@ -2060,7 +2138,9 @@ function inferSkillFromIntent(intentText) {
   const t = intentText.toLowerCase();
   if (/\b(presentation|slides?|deck|ppt|pitch deck|slideshow|gamma)\b/.test(t)) return "ppt-gamma";
   if (/\b(research|deep search|look up|find information|learn about|perplexity)\b/.test(t)) return "research-perplexity";
-  if (/\b(compare prices?|cheapest|best price|best deal|how much does|price compare)\b/.test(t)) return "price-compare";
+  // Don't route travel/accommodation "cheap" requests to price-compare
+  const isTravelContext = /\b(hotel|flight|fly|train|bus|ticket|accommodation|stay|room|hostel|resort|cab|taxi|uber|ola)\b/.test(t);
+  if (!isTravelContext && /\b(compare prices?|cheapest|best price|best deal|how much does|price compare)\b/.test(t)) return "price-compare";
   if (/\b(summarize (this |the )?video|youtube summary|what is this video|video summary)\b/.test(t)) return "youtube-summarize";
   if (/\b(design|ui mockup|landing page design|app design|interface design|stitch)\b/.test(t)) return "design-stitch";
   if (/\b(fill (this |the )?form|apply|sign up|register|checkout form|form fill)\b/.test(t)) return "form-fill";
@@ -2073,7 +2153,7 @@ async function dispatchTask(intentText, currentTab) {
   if (abortController) abortController.abort();
   abortController = new AbortController();
 
-  broadcastEvent({ type: "TASK_DISPATCHED", intentText });
+  broadcastEvent({ type: "TASK_DISPATCHED", intentText, tabId: currentTab?.id });
 
   // Augment with screen context FIRST — must happen before fast-path so skills like
   // price-compare and shopping know what product is on screen before routing.
@@ -2118,15 +2198,20 @@ async function dispatchTask(intentText, currentTab) {
     if (orchestratorDecision && orchestratorDecision.skill && orchestratorDecision.skill !== fastSkill) {
       console.log("BG: Orchestrator overrode fast-skill:", orchestratorDecision.skill, "replacing", fastSkill);
       const planText = orchestratorDecision.planSummary || `Working on: ${intentText}`;
-      broadcastEvent({ type: "PLAN_ANNOUNCED", steps: orchestratorDecision.steps, planText });
+      broadcastEvent({ type: "PLAN_ANNOUNCED", steps: orchestratorDecision.steps, planText, tabId: currentTab?.id });
       sendToGeminiLive(`[STATUS: ${planText}]`);
+      await sleep(1200);
+      if (abortController.signal.aborted) return;
       await executePlan(orchestratorDecision, intentText, currentTab);
       return;
     }
 
     const planText = `On it — using ${fastSkill}.`;
-    broadcastEvent({ type: "PLAN_ANNOUNCED", planText });
+    broadcastEvent({ type: "PLAN_ANNOUNCED", planText, tabId: currentTab?.id });
     sendToGeminiLive(`[STATUS: Starting now.]`);
+    // Brief pause so the user can click "do in background" if they want
+    await sleep(1200);
+    if (abortController.signal.aborted) return;
     await executePlan({ taskType: "simple", skill: fastSkill, steps: [] }, intentText, currentTab);
     return;
   }
@@ -2145,17 +2230,41 @@ async function dispatchTask(intentText, currentTab) {
   // Never ask for confirmation — always execute immediately.
   // The agent announces the plan via STATUS and gets to work.
   const planText = decision.planSummary || `Working on: ${intentText}`;
-  broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText });
+  broadcastEvent({ type: "PLAN_ANNOUNCED", steps: decision.steps, planText, tabId: currentTab?.id });
   sendToGeminiLive(`[STATUS: ${planText}]`);
+  // Brief pause so the user can click "do in background" if they want
+  await sleep(1200);
+  if (abortController.signal.aborted) return;
   await executePlan(decision, intentText, currentTab);
 }
 
 // ---- Execute a decided plan ----
 async function executePlan(decision, intentText, currentTab) {
+  // User pressed "do in background" before execution started — fork to bg mode
+  if (pendingBackgroundFlag) {
+    pendingBackgroundFlag = false;
+    if (bgTasks.size >= MAX_BG_TASKS) {
+      sendToRobot(currentTab?.id, {
+        type: 'ROBOT_MSG',
+        text: `Already running ${MAX_BG_TASKS} background tasks. Wait for one to finish.`,
+        msgType: 'speech'
+      });
+      return;
+    }
+    const bgTask = createBgTask(intentText, currentTab?.id);
+    runBgTask(bgTask, decision, intentText, currentTab).catch(e => {
+      finalizeBgTask(bgTask.taskId, 'failed', null, e?.message);
+    });
+    return;
+  }
+
   if (abortController) abortController.abort();
   abortController = new AbortController();
   const { signal } = abortController;
   isTaskRunning = true;
+  foregroundTask = { decision, intentText, currentTab };
+  const myGen = ++fgTaskGeneration;
+  chrome.storage.session.set({ ctrl_robot_display: { state: 'acting', isRunning: true } }).catch(() => {});
 
   try {
     const { taskType, skill, steps, parallelSubtasks } = decision;
@@ -2322,7 +2431,11 @@ async function executePlan(decision, intentText, currentTab) {
       sendToGeminiLive(`[TASK_DONE: Completed all ${steps.length} steps for: ${intentText}]`);
     }
   } finally {
-    isTaskRunning = false;
+    if (fgTaskGeneration === myGen) {
+      isTaskRunning = false;
+      foregroundTask = null;
+      chrome.storage.session.set({ ctrl_robot_display: { state: 'idle', isRunning: false } }).catch(() => {});
+    }
   }
 }
 
@@ -2421,6 +2534,238 @@ async function replayWorkflow(workflowName, tabId, signal) {
 
 // ---- Utility ----
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ---- Background Task Helpers ----
+
+function persistBgTasks() {
+  const serializable = [...bgTasks.values()].map(t => ({
+    taskId: t.taskId, intentText: t.intentText, status: t.status,
+    originTabId: t.originTabId, ownedTabIds: t.ownedTabIds,
+    tabGroupId: t.tabGroupId, startTime: t.startTime, summary: t.summary,
+    hasPendingQuestion: !!t.pendingFieldQuestion,
+    question: t.pendingFieldQuestion?.question,
+    fieldKey: t.pendingFieldQuestion?.fieldKey
+  }));
+  chrome.storage.session.set({ ctrl_bg_tasks: serializable }).catch(() => {});
+}
+
+function createBgTask(intentText, originTabId) {
+  const taskId = crypto.randomUUID();
+  const bgTask = {
+    taskId, intentText, status: 'pending',
+    originTabId: originTabId || null,
+    ownedTabIds: [], tabGroupId: null,
+    abortController: new AbortController(),
+    pendingFieldQuestion: null,
+    startTime: Date.now(), summary: null
+  };
+  bgTasks.set(taskId, bgTask);
+  if (originTabId) tabToTask.set(originTabId, taskId);
+  persistBgTasks();
+  broadcastRaw({ type: 'BG_TASKS_UPDATED' });
+  return bgTask;
+}
+
+function finalizeBgTask(taskId, status, summary = null, errorMsg = null) {
+  const bgTask = bgTasks.get(taskId);
+  if (!bgTask) return;
+  bgTask.status = status;
+  bgTask.summary = summary;
+
+  const notifTitle = status === 'done' ? 'ctrl — Task Complete' : 'ctrl — Task ' + (status === 'aborted' ? 'Cancelled' : 'Failed');
+  const notifMsg = (summary || errorMsg || bgTask.intentText).slice(0, 150);
+  chrome.notifications.create(`ctrl-bg-done-${taskId}`, {
+    type: 'basic', iconUrl: 'icons/icon128.png',
+    title: notifTitle, message: notifMsg, requireInteraction: false
+  }).catch(() => {});
+
+  // Update badge to reflect remaining running tasks
+  const runningCount = [...bgTasks.values()].filter(t => t.status === 'running' || t.status === 'awaiting_input').length;
+  chrome.action.setBadgeText({ text: runningCount > 0 ? String(runningCount) : '' }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ color: '#818cf8' }).catch(() => {});
+
+  sendToRobot(bgTask.originTabId, {
+    type: 'ROBOT_BG_COMPLETE', taskId, status,
+    summary: summary?.slice(0, 120), intentText: bgTask.intentText
+  });
+  for (const tabId of bgTask.ownedTabIds) {
+    sendToRobot(tabId, { type: 'ROBOT_BG_IDLE', taskId });
+  }
+
+  persistBgTasks();
+  broadcastRaw({ type: 'BG_TASKS_UPDATED' });
+}
+
+function waitForBgTaskFieldInput(bgTask, question, fieldKey, isSubjective = false, timeout = 90000) {
+  return new Promise((resolve) => {
+    bgTask.pendingFieldQuestion = { fieldKey, question, isSubjective, resolve };
+    bgTask.status = 'awaiting_input';
+    persistBgTasks();
+
+    chrome.notifications.create(`ctrl-fq-${bgTask.taskId}-${fieldKey}`, {
+      type: 'basic', iconUrl: 'icons/icon128.png',
+      title: 'ctrl needs your input',
+      message: question.slice(0, 100),
+      requireInteraction: true,
+      buttons: [{ title: 'Answer' }]
+    }).catch(() => {});
+
+    chrome.action.setBadgeText({ text: '?' }).catch(() => {});
+    chrome.action.setBadgeBackgroundColor({ color: '#ef4444' }).catch(() => {});
+
+    sendToRobot(bgTask.originTabId, {
+      type: 'ROBOT_BG_QUESTION',
+      taskId: bgTask.taskId,
+      question, fieldKey
+    });
+    broadcastRaw({ type: 'BG_TASKS_UPDATED' });
+
+    setTimeout(() => {
+      if (bgTask.pendingFieldQuestion?.resolve === resolve) {
+        bgTask.pendingFieldQuestion = null;
+        bgTask.status = 'running';
+        chrome.action.setBadgeText({ text: '' }).catch(() => {});
+        persistBgTasks();
+        broadcastEvent({ type: 'FIELD_ANSWERED', fieldKey, answer: null, timedOut: true });
+        resolve(null);
+      }
+    }, timeout);
+  });
+}
+
+// Runs a decided plan in a background tab (non-blocking, isolated from foreground task)
+async function runBgTask(bgTask, decision, intentText, currentTab) {
+  bgTask.status = 'running';
+  persistBgTasks();
+
+  const runningCount = [...bgTasks.values()].filter(t => t.status === 'running' || t.status === 'awaiting_input').length;
+  chrome.action.setBadgeText({ text: String(runningCount) }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ color: '#818cf8' }).catch(() => {});
+
+  const { signal } = bgTask.abortController;
+  const fieldInputFn = (question, fieldKey, isSubjective) =>
+    waitForBgTaskFieldInput(bgTask, question, fieldKey, isSubjective);
+
+  try {
+    let { taskType, skill, steps, parallelSubtasks } = decision;
+
+    // Multi-tab parallel: run existing logic but mute all spawned tabs and track them
+    if (taskType === 'multi-tab-parallel' || (skill === 'price-compare' && taskType !== 'multi-tab-parallel')) {
+      const tabsBefore = new Set((await chrome.tabs.query({})).map(t => t.id));
+      const result = await runMultiTabTask(decision, intentText, signal);
+      const tabsAfter = await chrome.tabs.query({});
+      const newTabIds = [];
+      for (const tab of tabsAfter) {
+        if (!tabsBefore.has(tab.id)) {
+          bgTask.ownedTabIds.push(tab.id);
+          tabToTask.set(tab.id, bgTask.taskId);
+          chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+          newTabIds.push(tab.id);
+        }
+      }
+      // Group the new tabs if not already grouped
+      if (newTabIds.length > 0) {
+        try {
+          const groupId = await chrome.tabs.group({ tabIds: newTabIds });
+          await chrome.tabGroups.update(groupId, {
+            title: `ctrl: ${intentText.slice(0, 22)}`,
+            color: 'purple',
+            collapsed: true
+          });
+          bgTask.tabGroupId = groupId;
+        } catch {}
+      }
+      const summary = typeof result === 'string' ? result.slice(0, 120) : `"${intentText.slice(0, 60)}" complete`;
+      finalizeBgTask(bgTask.taskId, 'done', summary);
+      return;
+    }
+
+    // Single-tab: create a fresh background tab in a named tab group
+    const startUrl = decision.startUrl || 'about:blank';
+    const bgTab = await chrome.tabs.create({ url: startUrl, active: false });
+    await chrome.tabs.update(bgTab.id, { muted: true });
+    bgTask.ownedTabIds.push(bgTab.id);
+    tabToTask.set(bgTab.id, bgTask.taskId);
+
+    // Put the tab in its own named group so it stays organised
+    try {
+      const groupId = await chrome.tabs.group({ tabIds: [bgTab.id] });
+      await chrome.tabGroups.update(groupId, {
+        title: `ctrl: ${intentText.slice(0, 22)}`,
+        color: 'purple',
+        collapsed: false
+      });
+      bgTask.tabGroupId = groupId;
+    } catch { /* tabGroups API may not be available on some builds */ }
+
+    persistBgTasks();
+
+    sendToRobot(bgTask.originTabId, {
+      type: 'ROBOT_BG_STARTED', taskId: bgTask.taskId, intentText
+    });
+
+    const tabId = bgTab.id;
+    if (startUrl !== 'about:blank') {
+      await waitForPageSettle(tabId).catch(() => {});
+      await sleep(NAVIGATE_SETTLE_MS);
+    }
+
+    const runAgent = async (goal, skillName) => {
+      try {
+        return await runVisionActionAgent(tabId, goal, skillName, null, null, signal, null,
+          { fieldInputFn, silent: true });
+      } catch (e) {
+        const msg = e?.message || String(e);
+        console.error('BG: bg task agent error:', msg);
+        broadcastEvent({ type: 'TASK_FAILED', tabId, error: msg });
+        return null;
+      }
+    };
+
+    let result = null;
+    if (skill) {
+      let agentGoal = intentText;
+      if (skill === 'form-fill') {
+        try {
+          const profile = await getUserProfile();
+          const profileStr = formatProfileForAgent(profile);
+          if (profileStr) agentGoal += '\n\nUser profile for form filling: ' + profileStr;
+        } catch {}
+      }
+      result = await runAgent(agentGoal, skill);
+    } else if (taskType === 'simple' || !steps?.length) {
+      result = await runAgent(intentText, null);
+    } else {
+      for (let i = 0; i < steps.length; i++) {
+        if (signal.aborted) break;
+        broadcastEvent({ type: 'STEP_START', step: i + 1, total: steps.length, desc: steps[i], tabId });
+        const stepGoal = `Overall goal: ${intentText}\nCurrent step ${i + 1} of ${steps.length}: ${steps[i]}`;
+        const res = await runAgent(stepGoal, null);
+        if (res === null) {
+          finalizeBgTask(bgTask.taskId, 'failed', null, 'Agent step failed');
+          return;
+        }
+        broadcastEvent({ type: 'STEP_DONE', step: i + 1, total: steps.length, tabId });
+      }
+      result = {};
+    }
+
+    if (signal.aborted) { finalizeBgTask(bgTask.taskId, 'aborted'); return; }
+
+    const summary = result && typeof result === 'object' && Object.keys(result).length
+      ? `Done: ${Object.entries(result).slice(0, 3).map(([k, v]) => `${k}: ${String(v).slice(0, 40)}`).join(', ')}`
+      : `Done: ${intentText.slice(0, 80)}`;
+    finalizeBgTask(bgTask.taskId, 'done', summary);
+
+  } catch (e) {
+    if (!signal.aborted) {
+      console.error('BG: runBgTask error:', e);
+      finalizeBgTask(bgTask.taskId, 'failed', null, e?.message || 'Unknown error');
+    } else {
+      finalizeBgTask(bgTask.taskId, 'aborted');
+    }
+  }
+}
 
 // ---- Message Handler ----
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -2622,6 +2967,80 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_SKILLS") {
     sendResponse({ skills: getSkillManifest() });
     return;
+  }
+
+  // ---- Background task messages ----
+
+  if (message.type === "SEND_TO_BACKGROUND") {
+    if (isTaskRunning && foregroundTask) {
+      // Task is mid-execution — abort it and re-spawn immediately as a bg task
+      const { decision, intentText, currentTab } = foregroundTask;
+      foregroundTask = null;
+      isTaskRunning = false;
+      pendingBackgroundFlag = false; // clear any stale flag to prevent double-spawn
+      fgTaskGeneration++; // invalidate the running executePlan's finally block
+      if (pendingFieldQuestion) { pendingFieldQuestion.resolve(null); pendingFieldQuestion = null; }
+      abortController?.abort();
+      chrome.storage.session.set({ ctrl_robot_display: { state: 'idle', isRunning: false } }).catch(() => {});
+      if (bgTasks.size < MAX_BG_TASKS) {
+        const bgTask = createBgTask(intentText, currentTab?.id);
+        runBgTask(bgTask, decision, intentText, currentTab).catch(e => {
+          finalizeBgTask(bgTask.taskId, 'failed', null, e?.message);
+        });
+      }
+    } else {
+      // Between plan-announced and execution start — set flag for executePlan to fork
+      pendingBackgroundFlag = true;
+    }
+    sendResponse({ success: true });
+    return;
+  }
+
+  if (message.type === "BG_FIELD_ANSWER") {
+    const bgTask = bgTasks.get(message.taskId);
+    if (bgTask?.pendingFieldQuestion) {
+      const { fieldKey, resolve } = bgTask.pendingFieldQuestion;
+      bgTask.pendingFieldQuestion = null;
+      bgTask.status = 'running';
+      chrome.action.setBadgeText({ text: '' }).catch(() => {});
+      persistBgTasks();
+      broadcastEvent({ type: 'FIELD_ANSWERED', fieldKey, answer: message.text });
+      resolve(message.text || null);
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
+  if (message.type === "ABORT_BG_TASK") {
+    const bgTask = bgTasks.get(message.taskId);
+    if (bgTask) {
+      bgTask.abortController.abort();
+      if (bgTask.pendingFieldQuestion) {
+        bgTask.pendingFieldQuestion.resolve(null);
+        bgTask.pendingFieldQuestion = null;
+      }
+      for (const tabId of bgTask.ownedTabIds) {
+        chrome.tabs.remove(tabId).catch(() => {});
+      }
+      if (bgTask.tabGroupId) {
+        chrome.tabGroups.update(bgTask.tabGroupId, { collapsed: true }).catch(() => {});
+      }
+      finalizeBgTask(message.taskId, 'aborted');
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
+  if (message.type === "GET_BG_TASKS") {
+    const tasks = [...bgTasks.values()].map(t => ({
+      taskId: t.taskId, intentText: t.intentText, status: t.status,
+      startTime: t.startTime, summary: t.summary,
+      hasPendingQuestion: !!t.pendingFieldQuestion,
+      question: t.pendingFieldQuestion?.question,
+      fieldKey: t.pendingFieldQuestion?.fieldKey
+    }));
+    sendResponse({ tasks });
+    return true;
   }
 });
 
